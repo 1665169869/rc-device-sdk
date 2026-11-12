@@ -8,9 +8,9 @@ use std::sync::Mutex;
 
 use rc_device::{
     CardDevice, CardDuration, CardIssuedAt, CardKind, CardSnapshot, CheckoutHourSpec, DeviceBackend,
-    DeviceError, DeviceInfo, DeviceResult, DriverArch, GuestDaySpec, GuestHourSpec, IdCardData,
-    IdCardProbeSpec, IdCardReadSpec, IdCardReader, IdCardServiceInfo, InstallSpec, MasterSpec,
-    PlainCardSpec, PortProbe, SelfTestReport, TimeSyncSpec, CARD_BYTES,
+    DeviceError, DeviceInfo, DeviceResult, DriverArch, DriverHashStatus, GuestDaySpec, GuestHourSpec,
+    IdCardData, IdCardProbeSpec, IdCardReadSpec, IdCardReader, IdCardServiceInfo, InstallSpec,
+    MasterSpec, PlainCardSpec, PortProbe, SelfTestReport, TimeSyncSpec, CARD_BYTES,
 };
 
 /// 发卡时刻固定值，让测试不随真实时间漂移。
@@ -166,6 +166,8 @@ impl CardDevice for MockCardDevice {
             backend: DeviceBackend::Mock,
             driver_path: "(mock)".into(),
             driver_sha256: None,
+            // 模拟后端没有真实驱动文件，谈不上与已验证版本比对
+            driver_hash_status: DriverHashStatus::Unknown,
             driver_arch: DriverArch::X86,
             port: self.port.load(Ordering::SeqCst),
             baud: 9600,

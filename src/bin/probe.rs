@@ -32,6 +32,15 @@ fn main() {
             println!("  驱动路径  : {}", info.driver_path);
             println!("  驱动架构  : {}", info.driver_arch);
             println!("  SHA-256   : {}", info.driver_sha256.as_deref().unwrap_or("(读不出)"));
+            // 哈希比对结论由设备层给出，这里只负责显示：
+            // 「不符」不是故障，照常可用，但卡格式结论不再可信。
+            println!(
+                "  版本校验  : {}",
+                if info.driver_hash_status.is_verified() { "已验证版本" } else { "⚠ 非已验证版本" }
+            );
+            if let Some(w) = info.driver_hash_status.warning() {
+                println!("  ⚠ 告警    : {w}");
+            }
             println!("  串口      : COM{}", u16::from(info.port) + 1);
             println!("  已打开    : {}", info.opened);
         }

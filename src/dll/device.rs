@@ -39,10 +39,12 @@ use std::time::Duration;
 
 use crate::builder;
 use crate::card::{
-    CardSnapshot, CheckoutHourSpec, DeviceBackend, DeviceInfo, GuestDaySpec, GuestHourSpec,
-    InstallSpec, MasterSpec, PlainCardSpec, PortProbe, SelfTestReport, TimeSyncSpec, CARD_BYTES,
+    CardSnapshot, CheckoutHourSpec, DeviceBackend, DeviceInfo, DriverHashStatus, GuestDaySpec,
+    GuestHourSpec, InstallSpec, MasterSpec, PlainCardSpec, PortProbe, SelfTestReport, TimeSyncSpec,
+    CARD_BYTES,
 };
 use crate::card_device::CardDevice;
+use crate::dll::arch::KNOWN_DRIVER_SHA256;
 use crate::dll::timing::{
     CONFIG_SETTLE_MS, OPEN_SETTLE_MS, RESHAKE_DELAY_MS, SETUP_PWM_DELAY_MS, VERIFY_RETRY_DELAY_MS,
     WRITE_PAGE1_DELAY_MS, WRITE_PAGE2_DELAY_MS,
@@ -391,10 +393,12 @@ impl CardDevice for DirectDllDevice {
         let st = self.lock()?;
         let path = self.driver_path();
         let arch = pe::pe_arch(&path);
+        let (sha256, hash_status) = driver_hash_status(&path);
         Ok(DeviceInfo {
             backend: DeviceBackend::DirectDll,
             driver_path: path.display().to_string(),
-            driver_sha256: sha256_of(&path),
+            driver_sha256: sha256,
+            driver_hash_status: hash_status,
             driver_arch: arch,
             port: st.port,
             baud: SERIAL_BAUD,
@@ -489,6 +493,32 @@ fn parse_hex28(hex: &str) -> DeviceResult<[u8; CARD_BYTES]> {
 fn sha256_of(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     Some(sha256_hex(&bytes))
+}
+
+/// 计算驱动哈希并与已验证版本比对，返回 `(原始哈希, 比对结论)`。
+///
+/// # 为什么在设备层比对
+///
+/// 比对只需要两样东西：文件哈希、以及「已验证版本是哪一版」。后者是编译期常量
+/// [`KNOWN_DRIVER_SHA256`]，本来就只属于硬件层。把它推给业务层意味着业务层要抄
+/// 一份 64 位十六进制常量——那份副本迟早与驱动文件脱节。
+///
+/// # 不符时不报错
+///
+/// 哈希不符不是故障：可能是厂商小版本升级，也可能是文件被替换，我们无法区分。
+/// 拒绝加载会让现场直接不可用，所以只如实报告结论，由业务层显示警告。
+fn driver_hash_status(path: &Path) -> (Option<String>, DriverHashStatus) {
+    match sha256_of(path) {
+        Some(actual) if actual == KNOWN_DRIVER_SHA256 => (Some(actual), DriverHashStatus::Verified),
+        Some(actual) => (
+            Some(actual.clone()),
+            DriverHashStatus::Mismatch {
+                expected: KNOWN_DRIVER_SHA256.to_string(),
+                actual,
+            },
+        ),
+        None => (None, DriverHashStatus::Unknown),
+    }
 }
 
 /// 供其它模块的测试复用的 SHA-256 入口。
@@ -686,6 +716,64 @@ mod tests {
         assert_eq!(info.backend, DeviceBackend::DirectDll);
         assert!(!info.opened);
         assert_eq!(info.baud, SERIAL_BAUD);
+    }
+
+    /// 仓库里这份驱动必须被判为「已验证」——这是哈希告警机制的正向基线。
+    ///
+    /// 若这条失败，说明驱动被换过：**卡格式结论需要重新评估**，
+    /// 此时 `driver_hash_status` 会变成 `Mismatch`，业务层据此显示警告。
+    #[test]
+    fn shipped_driver_hash_is_verified() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("drivers")
+            .join("LC2000")
+            .join(DRIVER_FILE);
+        let (sha, status) = driver_hash_status(&path);
+        assert_eq!(sha.as_deref(), Some(KNOWN_DRIVER_SHA256));
+        assert_eq!(status, DriverHashStatus::Verified);
+        assert!(status.is_verified());
+        assert_eq!(status.warning(), None, "已验证时不该有告警");
+    }
+
+    /// 哈希不符时**不报错**，只如实给出 `Mismatch`，并带期望值与实际值。
+    ///
+    /// 这是本条目最关键的一条：不符必须能加载、能工作，只是结论不可信。
+    #[test]
+    fn mismatched_hash_is_reported_not_rejected() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("rc-hash-mismatch-{}.dll", std::process::id()));
+        std::fs::write(&path, b"not the verified driver").expect("写临时文件");
+
+        let (sha, status) = driver_hash_status(&path);
+        let actual = sha.clone().expect("文件可读，哈希应能算出");
+        assert_eq!(actual, sha256_hex(b"not the verified driver"));
+        match &status {
+            DriverHashStatus::Mismatch { expected, actual: got } => {
+                assert_eq!(expected, KNOWN_DRIVER_SHA256);
+                assert_eq!(got, &actual);
+            }
+            other => panic!("应为 Mismatch，实际 {other:?}"),
+        }
+        assert!(!status.is_verified());
+        let warning = status.warning().expect("不符时必须给出告警");
+        assert!(warning.contains("不一致"), "告警应说明不一致：{warning}");
+        assert!(warning.contains(KNOWN_DRIVER_SHA256), "告警应带期望哈希");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 读不出哈希时是 `Unknown`，不能与「不符」混为一谈。
+    #[test]
+    fn unreadable_hash_is_unknown_not_mismatch() {
+        let path = Path::new(r"C:\no-such-dir\LC32RFRW.dll");
+        let (sha, status) = driver_hash_status(path);
+        assert_eq!(sha, None);
+        assert_eq!(status, DriverHashStatus::Unknown);
+        assert!(!status.is_verified());
+        let warning = status.warning().expect("读不出也应提示");
+        assert!(warning.contains("无法读取"), "告警应说明读不出来：{warning}");
     }
 
     /// 串口索引越界必须是参数错误。

@@ -488,6 +488,66 @@ pub enum DeviceBackend {
     Mock,
 }
 
+/// 驱动文件哈希与已验证版本的比对结果。
+///
+/// # 为什么要单独一个类型
+///
+/// [`DeviceInfo::driver_sha256`] 只是**原始值**。业务层要判断「这个驱动是不是我们
+/// 验证过的那一版」，就得自己记住那串 64 位十六进制并逐字比较——实际结果是没人比。
+/// 把比对结论放在设备层，业务层只需看这个字段。
+///
+/// # 不符时为什么不阻止加载
+///
+/// 哈希不符可能是厂商小版本升级（导出签名没变，卡格式大概率也没变），也可能是
+/// 文件被替换。**当场拒绝加载**会让现场无法工作，而我们的证据不足以断定是哪一种。
+/// 所以：照常加载，但把结论如实报出去，由业务层在设置页与诊断包里显示警告。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "status")]
+pub enum DriverHashStatus {
+    /// 与已验证版本完全一致。**卡格式结论对这种情况成立**。
+    Verified,
+    /// 读出了哈希但与已验证版本不符。
+    ///
+    /// 卡格式结论**不再可信**：需要重新评估，见 AGENTS.md §4。
+    Mismatch {
+        /// 期望值（编译期常量 [`crate::dll::arch::KNOWN_DRIVER_SHA256`]）。
+        expected: String,
+        /// 实际读到的值（小写十六进制）。
+        actual: String,
+    },
+    /// 读不出哈希：文件不存在、无权限、或后端不是真实驱动。
+    ///
+    /// 与 [`Self::Mismatch`] 不同——这里**不知道**文件是什么，谈不上「不符」。
+    Unknown,
+}
+
+impl DriverHashStatus {
+    /// 是否与已验证版本一致。
+    #[must_use]
+    pub fn is_verified(&self) -> bool {
+        matches!(self, Self::Verified)
+    }
+
+    /// 给界面/诊断包用的一句告警；一致或无从判断时返回 `None` 之外的人话。
+    ///
+    /// 这里**不返回错误**——哈希不符不是故障，只是「结论不可信」。
+    #[must_use]
+    pub fn warning(&self) -> Option<String> {
+        match self {
+            Self::Verified => None,
+            Self::Mismatch { expected, actual } => Some(format!(
+                "驱动版本与已验证版本不一致，卡格式结论可能不再成立。\
+                 期望 SHA-256 {expected}，实际 {actual}。\
+                 请重新跑 46 项自检与真机读写复测后再投入使用。"
+            )),
+            Self::Unknown => Some(
+                "无法读取驱动文件哈希，无法确认驱动版本。请检查驱动文件是否完整。"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
 /// 设备与运行时环境信息，用于状态条、诊断包与排障。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -499,7 +559,11 @@ pub struct DeviceInfo {
     /// 驱动文件的 SHA-256（小写十六进制）。用于比对已验证版本。
     ///
     /// 结论只对 SHA-256 `f2f483e0…bccbc0` 的 `LC32RFRW.dll` 成立，换版本需重新评估。
+    ///
+    /// 这是**原始值**；「是否等于已验证版本」的结论见 [`Self::driver_hash_status`]。
     pub driver_sha256: Option<String>,
+    /// 驱动哈希与已验证版本的比对结论。
+    pub driver_hash_status: DriverHashStatus,
     /// 驱动 PE 架构。该驱动只有 x86 版本。
     pub driver_arch: DriverArch,
     /// 当前串口索引 0–7。

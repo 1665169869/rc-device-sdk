@@ -530,6 +530,31 @@ mod tests {
         }
     }
 
+    /// 文件存在但不是有效 DLL 时报 `DriverNotLoaded`，不是「文件缺失」。
+    ///
+    /// 这条覆盖 `LoadLibrary` 真正失败的那条路径。现场会走到这里的场景包括：
+    /// 安全软件隔离、文件损坏、被换成改了后缀的其他文件。
+    /// 之前只有「文件缺失」一个测试，这条路径实际上没人看着。
+    #[test]
+    fn non_dll_file_reports_driver_not_loaded() {
+        let path = std::env::temp_dir().join(format!(
+            "rc-not-a-dll-{}.dll",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"this is definitely not a DLL").expect("写临时文件");
+
+        // 架构读不出来 → `check_loadable` 放行，把真实错误交给 `LoadLibrary`
+        match DllExports::load(&path) {
+            Err(e) => {
+                assert_eq!(e.kind(), "driver_not_loaded", "实际 kind 为 {}", e.kind());
+                assert_eq!(e.sdk_code(), 2, "驱动类故障统一映射到 SDK 码 2");
+            }
+            Ok(_) => panic!("文本文件不该被当成 DLL 加载成功"),
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// 32 位宿主能真正加载真实驱动（这条只在 x86 目标下有意义）。
     #[cfg(target_arch = "x86")]
     #[test]

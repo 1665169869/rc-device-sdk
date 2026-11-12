@@ -384,6 +384,66 @@ mod tests {
         }
     }
 
+    /// 缺导出时消息必须带函数名——现场据此判断是哪个符号没了。
+    ///
+    /// 「驱动版本不兼容」这四个字帮不上任何忙；`te_writepwm_asc` 才是能拿去比对
+    /// 导出表的信息。
+    #[test]
+    fn export_missing_message_carries_function_name() {
+        let e = DeviceError::DriverExportMissing("te_writepwm_asc".into());
+        assert!(
+            e.to_string().contains("te_writepwm_asc"),
+            "Display 应带函数名：{e}"
+        );
+
+        let p = e.payload();
+        assert!(p.message.contains("te_writepwm_asc"), "IPC 载荷也要带函数名");
+        assert_eq!(p.kind, "driver_export_missing");
+        assert_eq!(p.sdk_code, 2);
+        assert!(p.device_fault);
+    }
+
+    /// 错误文案里不能出现业务词汇——分层边界的最后一道防线。
+    ///
+    /// 硬件层不认识房号、房态、入住。一旦这些词出现在错误消息或处理建议里，
+    /// 说明有人把业务判断塞进了 Rust 侧。
+    #[test]
+    fn error_text_never_mentions_business_concepts() {
+        let all = [
+            DeviceError::Param("x".into()),
+            DeviceError::DriverNotLoaded("x".into()),
+            DeviceError::DriverFileMissing("x".into()),
+            DeviceError::DriverArchMismatch {
+                dll: DriverArch::X86,
+                host: DriverArch::X86_64,
+            },
+            DeviceError::DriverExportMissing("x".into()),
+            DeviceError::NotOpen,
+            DeviceError::Timeout(15),
+            DeviceError::PortOpenFailed { port: 2 },
+            DeviceError::HandshakeFailed,
+            DeviceError::NoCard,
+            DeviceError::ReadFailed("x".into()),
+            DeviceError::WriteFailed("x".into()),
+            DeviceError::VerifyFailed,
+            DeviceError::InvalidCardNo(0),
+            DeviceError::Unsupported("x".into()),
+            DeviceError::StateFile("x".into()),
+            DeviceError::Protocol("x".into()),
+            DeviceError::Io("x".into()),
+            DeviceError::IdCardService("x".into()),
+        ];
+        // 「退房」不在禁词里：`CheckoutHour`（退房钟点卡）是硬件卡型名，属协议词汇。
+        let forbidden = ["房号", "房态", "入住", "发卡上限", "住客", "客史"];
+        for e in all {
+            let p = e.payload();
+            for w in forbidden {
+                assert!(!p.message.contains(w), "{e:?} 的消息里出现了业务词「{w}」");
+                assert!(!p.hint.contains(w), "{e:?} 的建议里出现了业务词「{w}」");
+            }
+        }
+    }
+
     /// 无卡不是设备故障，只是操作问题——设备状态条不该因此变红。
     #[test]
     fn no_card_is_not_a_device_fault() {

@@ -99,9 +99,10 @@ pub use builder::{
 
 pub use card::{
     decode_room_index, encode_room_index, CardDuration, CardIssuedAt, CardKind, CardSnapshot,
-    CardStamp, CheckoutHourSpec, DeviceBackend, DeviceInfo, GuestDaySpec, GuestHourSpec,
-    InstallSpec, MasterSpec, PlainCardSpec, PortProbe, SelfTestCase, SelfTestReport, TimeSyncSpec,
-    CARD_BYTES, CARD_PREFIX, MASTER_ROOM_INDEX, PAGE_BYTES, ROOM_INDEX_MAX,
+    CardStamp, CheckoutHourSpec, DeviceBackend, DeviceInfo, DriverHashStatus, GuestDaySpec,
+    GuestHourSpec, InstallSpec, MasterSpec, PlainCardSpec, PortProbe, SelfTestCase,
+    SelfTestReport, TimeSyncSpec, CARD_BYTES, CARD_PREFIX, MASTER_ROOM_INDEX, PAGE_BYTES,
+    ROOM_INDEX_MAX,
 };
 pub use card_device::CardDevice;
 pub use error::{DeviceError, DeviceErrorPayload, DeviceResult, DriverArch};
