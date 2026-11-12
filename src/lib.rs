@@ -83,6 +83,7 @@
 pub mod builder;
 pub mod card;
 pub mod card_device;
+pub mod dll;
 pub mod error;
 pub mod idcard;
 pub mod parser;

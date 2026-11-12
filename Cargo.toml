@@ -6,11 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 description = "客房微管理发卡台 · 硬件层接口契约（125 kHz 门锁卡读写器 + 身份证读卡器）"
 
-# 本 crate 只放**接口契约**（trait / 类型 / 错误）。
-# 实现依赖（libloading、tungstenite 等）在对应 td 条目落地时再加，见 plan/td-002.md、plan/td-007.md。
+# 本 crate 放接口契约（trait / 类型 / 错误）与硬件实现。
+# 身份证读卡器的 WebSocket 依赖（tungstenite）在 TD-007 落地时再加。
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
+# 动态加载 LC32RFRW.dll（TD-002）。该驱动只有 x86 版本，宿主必须按 i686 构建。
+libloading = "0.8"
 
 [dev-dependencies]
 serde_json = "1"
