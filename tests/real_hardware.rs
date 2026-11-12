@@ -262,3 +262,82 @@ fn write_install_card_to_real_hardware() {
 
     dev.close().expect("关闭应当成功");
 }
+
+/// 真机擦卡：页1/页2 全零，卡变空白卡；随后写回安装卡。
+///
+/// # 这张卡是耗材
+///
+/// 擦卡会清空卡内容，之后必须重新写入才有用。本测试擦完立刻按原序号写回，
+/// 所以卡最终仍是一张可用的安装卡——但中途确实被擦白过。
+///
+/// # 验证顺序为什么是这样
+///
+/// 1. 读卡，记下原序号（若本来就不是安装卡则跳过，不在陌生卡上乱擦）；
+/// 2. `erase_card()` → 断言返回 `CardKind::Blank`、28 字节全零；
+/// 3. 独立再读一次，确认**卡里**真的空了，而不只是返回快照骗人；
+/// 4. 写回安装卡，确认擦卡没把卡弄成不可写的状态。
+///
+/// 第 3 步是关键：只信 `erase_card()` 的返回值等于自证，
+/// 必须用一次全新的读卡确认硬件上真的写进去了。
+#[test]
+fn erase_card_on_real_hardware_then_restore() {
+    let Some(dev) = device_or_skip("erase_card") else {
+        return;
+    };
+    dev.open().expect("打开应当成功");
+
+    let before = dev.read_card().expect("擦卡前应先能读卡");
+    println!("[擦卡前] 卡型: {}", before.kind.label());
+    println!("[擦卡前] 序号: {:?}", before.room_index);
+    println!("[擦卡前] 原始: {}", before.raw_hex());
+
+    if before.kind != CardKind::Install {
+        println!(
+            "[erase_card] 跳过：当前卡是 {}，不是安装卡。\
+             擦卡会清空内容，本测试只在确认可弃用的安装卡上做。",
+            before.kind.label()
+        );
+        dev.close().ok();
+        return;
+    }
+    let room_index = before
+        .room_index
+        .expect("安装卡必须带房间序号");
+
+    // 1) 擦卡
+    let erased = dev.erase_card().expect("擦卡应当成功");
+    println!("[擦卡后] 卡型: {}", erased.kind.label());
+    println!("[擦卡后] 原始: {}", erased.raw_hex());
+
+    assert_eq!(erased.kind, CardKind::Blank, "擦完应是空白卡");
+    assert_eq!(erased.raw, [0u8; 28], "擦完 28 字节应全零");
+    assert_eq!(
+        erased.room_index, None,
+        "空白卡不该带房间序号"
+    );
+    assert_eq!(erased.card_no, None, "擦卡不消耗作业流水号");
+
+    // 2) 独立重读：确认卡里真的空了，不是返回快照骗人
+    let reread = dev.read_card().expect("擦卡后应仍能读卡");
+    println!("[重读] 卡型: {}", reread.kind.label());
+    println!("[重读] 原始: {}", reread.raw_hex());
+    assert_eq!(reread.kind, CardKind::Blank, "硬件上应真的是空白卡");
+    assert_eq!(reread.raw, [0u8; 28], "硬件上 28 字节应全零");
+
+    // 3) 写回安装卡：确认擦卡后卡仍可写，且内容恢复
+    let restored = dev
+        .write_install(&InstallSpec { room_index })
+        .expect("擦卡后应能重新写入安装卡");
+    println!("[写回] 卡型: {}", restored.kind.label());
+    println!("[写回] 原始: {}", restored.raw_hex());
+
+    assert_eq!(restored.kind, CardKind::Install);
+    assert_eq!(restored.raw_hex(), before.raw_hex(), "写回后应与擦卡前一致");
+
+    // 4) 再独立读一次收尾
+    let final_read = dev.read_card().expect("写回后应能读到");
+    assert_eq!(final_read.raw_hex(), before.raw_hex());
+    assert_eq!(final_read.kind, CardKind::Install);
+
+    dev.close().expect("关闭应当成功");
+}
