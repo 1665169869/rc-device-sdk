@@ -8,30 +8,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{DeviceError, DeviceResult, DriverArch};
 
-/// 卡数据的有效字节数。卡内只有 8 字节有效数据（页1 + 页2），
-/// 但读卡器一次返回 28 字节，页 3–7 恒为 0。
-pub const CARD_BYTES: usize = 28;
-
-/// 单页字节数（页1 / 页2 各 4 字节）。
-pub const PAGE_BYTES: usize = 4;
-
-/// TEMIC 卡数据在 28 字节中的前两个字节恒为 `5B EC`。
-///
-/// **仅用于包识别**，不参与任何序号运算。
-pub const CARD_PREFIX: [u8; 2] = [0x5B, 0xEC];
-
-/// 房间序号最大值：12 bit → `0x0FFF` = 4095。
-///
-/// 这是卡格式的硬上限，**不是业务规则**（一个系统能建多少房间由业务层决定）。
-pub const ROOM_INDEX_MAX: u16 = 0x0FFF;
-
-/// 总控卡占用的房间序号：12 位全 1（`0x0FFF` = 4095）。
-///
-/// 现场读到页1 = `5B EC F0 FF` 时，按位打包解出的正是 4095。
-/// 总控卡不属于任何单一房间，读卡后业务层不应拿它回查房间表。
-pub const MASTER_ROOM_INDEX: u16 = ROOM_INDEX_MAX;
+// 协议常量统一在 `crate::protocol` 定义，这里重新导出以保持既有调用路径不变。
+pub use crate::protocol::{
+    BYTE_MASK, CARD_BYTES, CARD_PREFIX, LOST_FLAG_BITS, LOST_FLAG_CLEAR, LOST_FLAG_SET,
+    MASTER_ROOM_INDEX, MONTH_MASK, PAGE_BYTES, PAYLOAD_BYTES, ROOM_HIGH_SHIFT,
+    ROOM_INDEX_MAX, ROOM_LOW_NIBBLE_MASK, ROOM_LOW_NIBBLE_SHIFT, YEAR_BASE, YEAR_CYCLE,
+    YEAR_MASK, YEAR_SHIFT,
+};
 
 // ---------------------------------------------------------------- 卡型
+
+/// 大写十六进制字符表，供 [`CardSnapshot::raw_hex`] 查表使用。
+pub const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 
 /// 卡型。与原 C# SDK 的 `CardKind` 一一对应，取值来源是读卡后按卡内字节判定的结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,7 +118,7 @@ impl CardKind {
 ///
 /// # 例（全部来自原厂实测样本）
 ///
-/// | room_index | lost | B2 | B3 | 页1 |
+/// | `room_index` | lost | B2 | B3 | 页1 |
 /// |---|---|---|---|---|
 /// | 15（220 房） | false | `0xF0` | `0x00` | `5BEC F000` |
 /// | 6（209 房）  | false | `0x60` | `0x00` | `5BEC 6000` |
@@ -156,9 +144,9 @@ pub fn encode_room_index(room_index: u16, lost: bool) -> DeviceResult<[u8; 2]> {
             "房间序号 {room_index} 超出 12 位上限 {ROOM_INDEX_MAX}"
         )));
     }
-    let low_nibble: u8 = if lost { 1 } else { 0 };
-    let b2 = (((room_index & 0x0F) as u8) << 4) | low_nibble;
-    let b3 = ((room_index >> 4) & 0xFF) as u8;
+    let low_nibble: u8 = if lost { LOST_FLAG_SET } else { LOST_FLAG_CLEAR };
+    let b2 = (((room_index & ROOM_LOW_NIBBLE_MASK) as u8) << ROOM_LOW_NIBBLE_SHIFT) | low_nibble;
+    let b3 = ((room_index >> ROOM_HIGH_SHIFT) & BYTE_MASK) as u8;
     Ok([b2, b3])
 }
 
@@ -196,8 +184,8 @@ pub fn encode_room_index(room_index: u16, lost: bool) -> DeviceResult<[u8; 2]> {
 /// 按本函数解出的 `lost_flag` 会是 `true`，调用方应忽略它——
 /// 安装卡没有「挂失」概念。
 pub fn decode_room_index(b2: u8, b3: u8) -> (u16, bool) {
-    let index = ((b3 as u16) << 4) | ((b2 >> 4) as u16);
-    (index, (b2 & 0x0F) != 0)
+    let index = (u16::from(b3) << ROOM_HIGH_SHIFT) | u16::from(b2 >> ROOM_LOW_NIBBLE_SHIFT);
+    (index, (b2 & LOST_FLAG_BITS) != 0)
 }
 
 // ---------------------------------------------------------------- 时长
@@ -404,8 +392,17 @@ impl CardSnapshot {
     }
 
     /// 28 字节转大写十六进制（56 个字符），与原 SDK 的 `RawHex` 对应。
+    ///
+    /// 用查表法而不是 `format!`：一次预分配、无中间 `String`，
+    /// 也避开了 `fmt::Write` 的 `Result` 处理（在 `String` 上永不失败，
+    /// 但忽略返回值会显得像吞异常）。
     pub fn raw_hex(&self) -> String {
-        self.raw.iter().map(|b| format!("{b:02X}")).collect()
+        let mut s = String::with_capacity(CARD_BYTES * 2);
+        for b in &self.raw {
+            s.push(HEX_UPPER[(b >> 4) as usize] as char);
+            s.push(HEX_UPPER[(b & 0x0F) as usize] as char);
+        }
+        s
     }
 
     /// 卡数据是否以 `5B EC` 开头且长度正确。
@@ -516,6 +513,7 @@ pub struct DeviceInfo {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -606,7 +604,7 @@ mod tests {
         assert!(s.has_temic_prefix());
     }
 
-    /// raw_hex 必须 56 个字符、全大写，与 SDK 输出可直接比对。
+    /// `raw_hex` 必须 56 个字符、全大写，与 SDK 输出可直接比对。
     #[test]
     fn raw_hex_is_uppercase_and_56_chars() {
         let s = snapshot(CardKind::GuestDay);
@@ -683,7 +681,7 @@ mod tests {
 
     // ------------------------------------------------ 房间序号位打包（12 bit）
 
-    /// 33 条黄金向量里出现过的全部 room_index，逐一比对页1 的 B2/B3。
+    /// 33 条黄金向量里出现过的全部 `room_index，逐一比对页1` 的 B2/B3。
     ///
     /// 这是「12 位位打包」与实测样本一致性的核心证据。
     #[test]
@@ -755,7 +753,7 @@ mod tests {
         assert_ne!(u16::from_be_bytes([b2, b3]), idx, "按大端解析会错");
 
         // 正确解法：B3 是高位、B2 的高半字节是低位
-        assert_eq!(((b3 as u16) << 4) | ((b2 >> 4) as u16), idx);
+        assert_eq!((u16::from(b3) << 4) | u16::from(b2 >> 4), idx);
     }
 
     /// 超出 12 位的序号必须是参数错误，而不是静默截断。

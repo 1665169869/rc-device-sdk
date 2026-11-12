@@ -149,6 +149,7 @@ pub trait IdCardReader: Send + Sync {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -184,7 +185,7 @@ mod tests {
     fn whitespace_only_is_not_identity() {
         let blank = IdCardData {
             name: Some("   ".into()),
-            id_number: Some("".into()),
+            id_number: Some(String::new()),
             ..Default::default()
         };
         assert!(!blank.has_identity());

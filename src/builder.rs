@@ -22,43 +22,20 @@ use crate::card::{
 };
 use crate::error::{DeviceError, DeviceResult};
 
-/// 原厂固定写密码（TEMIC 卡写保护密码）。
-///
-/// 写入时以**十六进制 ASCII 字符串**传给 `te_setuppwm_asc` / `te_writepwm_asc`，
-/// 即"12000206" 这 8 个字符。
-pub const WRITE_PASSWORD: &str = "12000206";
-
-/// 安装卡页2 固定值。安装卡不含作业流水号。
-pub const INSTALL_PAGE2: [u8; 4] = [0x46, 0xF2, 0x00, 0x01];
-
-/// 安装卡页1 低 4 位的固定值（不是挂失标志）。
-///
-/// 原 SDK `BuildInstall` 里硬编码 `0x0C`。安装卡没有"挂失"概念。
-pub const INSTALL_LOW_NIBBLE: u8 = 0x0C;
-
-/// 复位卡页1 后两字节。
-pub const RESET_PAGE1_TAIL: [u8; 2] = [0x0A, 0x00];
-
-/// 清除卡页1 后两字节。
-pub const CLEAR_PAGE1_TAIL: [u8; 2] = [0x9B, 0xE5];
-
-/// 清除卡页2 首字节。
-pub const CLEAR_PAGE2_HEAD: u8 = 0xC7;
-
-/// 总控卡页1 后两字节（= 12 位序号全 1，即 4095）。
-pub const MASTER_PAGE1_TAIL: [u8; 2] = [0xF0, 0xFF];
-
-/// 退房钟点设置卡页1 第 3 字节（固定标记）。
-pub const CHECKOUT_HOUR_MARKER: u8 = 0x7B;
-
-/// 退房钟点设置卡页2 首字节。
-pub const CHECKOUT_HOUR_PAGE2_HEAD: u8 = 0xFF;
-
-/// 校时卡页2 首字节（明文，IDA: `LOBYTE(v14[2]) = 6`）。
-pub const TIMESYNC_PAGE2_HEAD: u8 = 0x06;
-
-/// 校时卡旧卡首字节（加扰残留，读卡时要能认）。
-pub const TIMESYNC_PAGE2_HEAD_LEGACY: u8 = 0x14;
+// 协议常量统一在 `crate::protocol` 定义，这里重新导出以保持既有调用路径不变。
+pub use crate::protocol::{
+    BYTE_MASK, CARD_NO_DAY_MASK, CARD_NO_DAY_SHIFT, CARD_NO_HIGH_SHIFT, CARD_NO_HOUR_MASK,
+    CARD_NO_HOUR_SHIFT, CARD_NO_SEQ_MASK, CHECKOUT_HOUR_MARKER, CHECKOUT_HOUR_PAGE2_HEAD,
+    CLEAR_PAGE1_TAIL, CLEAR_PAGE2_HEAD, DAYS_PER_MONTH, DAY_SIMPLE_PREFIX, DURATION_MASK,
+    ERASE_PAGE, HOUR_PREFIX, INSTALL_LOW_NIBBLE, INSTALL_PAGE2, MASTER_PAGE1_TAIL,
+    MAX_DAY_OF_MONTH, MAX_GUEST_HOURS, MAX_HOURS_MASTER, MAX_HOUR_OF_DAY, MAX_MINUTE, MAX_MONTH,
+    MAX_SIMPLE_DAYS, MAX_TOTAL_DAYS, MAX_YEAR, MIN_DAYS, MIN_HOURS, MIN_MONTH, MIN_YEAR,
+    MINUTE_HIGH_SHIFT, MINUTE_LOW_MASK, MONTH_MASK, MONTH_PREFIX, MONTHS_MAX, PAGE_BYTES,
+    PAYLOAD_BYTES, RESET_PAGE1_TAIL, RESET_PAGE2_HEAD, ROOM_HIGH_SHIFT, ROOM_LOW_NIBBLE_MASK,
+    ROOM_LOW_NIBBLE_SHIFT, ROUND_HALF_GAP, SEQ_MAX, TIMESYNC_HOUR_FACTOR, TIMESYNC_HOUR_MASK,
+    TIMESYNC_MINUTE_LOW_FACTOR, TIMESYNC_MINUTE_LOW_OFFSET, TIMESYNC_PAGE2_HEAD,
+    TIMESYNC_PAGE2_HEAD_LEGACY, WRITE_PASSWORD, YEAR_BASE, YEAR_CYCLE, YEAR_MASK, YEAR_SHIFT,
+};
 
 // ---------------------------------------------------------------- 年月字节
 
@@ -71,10 +48,10 @@ pub const TIMESYNC_PAGE2_HEAD_LEGACY: u8 = 0x14;
 ///
 /// **16 年一循环**：2026-11 = `0xAB`、2027-11 = `0xBB`、2042-11 又是 `0xAB`。
 pub fn year_month_byte(at: &CardIssuedAt) -> u8 {
-    // 用取模而不是直接 & 0x0F，避免 year < 2000 时出现负数补码的意外值
-    let year_part = (((at.year - 2000) % 16 + 16) % 16) as u8;
-    let month_part = at.month & 0x0F;
-    (year_part << 4) | month_part
+    // 用取模而不是直接按位与，避免 year < YEAR_BASE 时出现负数补码的意外值
+    let year_part = (((at.year - YEAR_BASE) % YEAR_CYCLE + YEAR_CYCLE) % YEAR_CYCLE) as u8;
+    let month_part = at.month & MONTH_MASK;
+    (year_part << YEAR_SHIFT) | month_part
 }
 
 /// 从页2[3] 还原完整年份（读卡侧用，需要业务层提供"当前年"作锚点）。
@@ -86,8 +63,8 @@ pub fn year_month_byte(at: &CardIssuedAt) -> u8 {
 /// 这是 16 年循环的还原规则（原厂 `sub_1000260C`）。业务层必须传入**当前年**，
 /// 因为卡里只有 4 位年份，单靠卡本身无法区分 2026 与 2042。
 pub fn restore_year(year_month_byte: u8, current_year: i32) -> i32 {
-    let high = (year_month_byte >> 4) as i32;
-    2000 + 16 * ((current_year - 2000) / 16) + high
+    let high = i32::from(year_month_byte >> YEAR_SHIFT);
+    YEAR_BASE + YEAR_CYCLE * ((current_year - YEAR_BASE) / YEAR_CYCLE) + high
 }
 
 // ---------------------------------------------------------------- 时长码
@@ -109,24 +86,26 @@ pub fn restore_year(year_month_byte: u8, current_year: i32) -> i32 {
 ///
 /// 所以这里用整数算术实现银行家舍入，既避开了浮点精度问题，也精确复刻原行为。
 pub fn duration_days_code(days: u16) -> u8 {
-    let d = if days < 1 { 1 } else { days };
-    if d <= 63 {
-        return 0x80 | (d & 0x3F) as u8;
+    let d = if days < MIN_DAYS { MIN_DAYS } else { days };
+    if d <= MAX_SIMPLE_DAYS {
+        return DAY_SIMPLE_PREFIX | (d & u16::from(DURATION_MASK)) as u8;
     }
-    let months = round_half_to_even(d as u32);
-    let months = months.clamp(1, 63);
-    0xC0 | (months & 0x3F) as u8
+    let months = round_half_to_even(u32::from(d));
+    let months = months.clamp(1, u32::from(MONTHS_MAX));
+    MONTH_PREFIX | (months & u32::from(DURATION_MASK)) as u8
 }
 
-/// 整数版银行家舍入：`round_half_to_even(n / 30)`。
+/// 整数版银行家舍入：`round_half_to_even(n / DAYS_PER_MONTH)`。
 ///
-/// - 余数 < 15 → 舍
-/// - 余数 > 15 → 入
-/// - 余数 = 15 → 取偶数（`.5` 时向偶数靠）
+/// - 余数 < `ROUND_HALF_GAP` → 舍
+/// - 余数 > `ROUND_HALF_GAP` → 入
+/// - 余数 = `ROUND_HALF_GAP` → 取偶数（`.5` 时向偶数靠）
 fn round_half_to_even(n: u32) -> u32 {
-    let q = n / 30;
-    let r = n % 30;
-    match r.cmp(&15) {
+    let divisor = u32::from(DAYS_PER_MONTH);
+    let gap = u32::from(ROUND_HALF_GAP);
+    let q = n / divisor;
+    let r = n % divisor;
+    match r.cmp(&gap) {
         std::cmp::Ordering::Less => q,
         std::cmp::Ordering::Greater => q + 1,
         std::cmp::Ordering::Equal => {
@@ -147,10 +126,12 @@ fn round_half_to_even(n: u32) -> u32 {
 /// 客卡比总控卡少 1，是因为客卡要把小时数加 1 后编码，占掉了 63 这一格。
 /// 这是实测差异，不要"顺手统一"。
 pub fn duration_hours_code(hours: u16, guest: bool) -> u8 {
-    let h = if hours < 1 { 1 } else { hours };
+    let h = if hours < MIN_HOURS { MIN_HOURS } else { hours };
     let v = if guest { h.saturating_add(1) } else { h };
-    let v = v.min(63);
-    0x40 | (v as u8 & 0x3F)
+    // 截断的是**编码后的值**，不是入参小时数：客卡的 h+1 恰好可能等于 62+1=63。
+    // 六位字段满值就是 DURATION_MASK（0x3F = 63）。
+    let v = v.min(u16::from(DURATION_MASK));
+    HOUR_PREFIX | (v as u8 & DURATION_MASK)
 }
 
 // ---------------------------------------------------------------- 作业流水号
@@ -163,23 +144,26 @@ pub fn duration_hours_code(hours: u16, guest: bool) -> u8 {
 ///
 /// `seq` 取 **0–62**（卡内序号 = 本小时第 n 张 − 1）。
 pub fn timestamp_card_no(at: &CardIssuedAt, seq: u8) -> DeviceResult<u16> {
-    if seq > 62 {
+    if seq > SEQ_MAX {
         return Err(DeviceError::Param(format!(
-            "小时内序号必须在 0–62，实际 {seq}"
+            "小时内序号必须在 0–{SEQ_MAX}，实际 {seq}"
         )));
     }
-    if !(1..=31).contains(&at.day) {
-        return Err(DeviceError::Param(format!("日必须是 1–31，实际 {}", at.day)));
-    }
-    if at.hour > 23 {
+    if !(1..=MAX_DAY_OF_MONTH).contains(&at.day) {
         return Err(DeviceError::Param(format!(
-            "小时必须是 0–23，实际 {}",
+            "日必须是 1–{MAX_DAY_OF_MONTH}，实际 {}",
+            at.day
+        )));
+    }
+    if at.hour > MAX_HOUR_OF_DAY {
+        return Err(DeviceError::Param(format!(
+            "小时必须是 0–{MAX_HOUR_OF_DAY}，实际 {}",
             at.hour
         )));
     }
-    Ok((((at.day & 0x1F) as u16) << 11)
-        | (((at.hour & 0x1F) as u16) << 6)
-        | (seq & 0x3F) as u16)
+    Ok(((u16::from(at.day) & CARD_NO_DAY_MASK) << CARD_NO_DAY_SHIFT)
+        | ((u16::from(at.hour) & CARD_NO_HOUR_MASK) << CARD_NO_HOUR_SHIFT)
+        | (u16::from(seq) & CARD_NO_SEQ_MASK))
 }
 
 /// 从作业流水号还原发卡日 / 时 / 小时内序号。
@@ -187,9 +171,9 @@ pub fn timestamp_card_no(at: &CardIssuedAt, seq: u8) -> DeviceResult<u16> {
 /// 卡内**没有年月**——年月在页2[3]，需要配合 [`restore_year`] 使用。
 pub fn decode_timestamp_card_no(card_no: u16) -> crate::card::CardStamp {
     crate::card::CardStamp {
-        day: ((card_no >> 11) & 0x1F) as u8,
-        hour: ((card_no >> 6) & 0x1F) as u8,
-        seq: (card_no & 0x3F) as u8,
+        day: ((card_no >> CARD_NO_DAY_SHIFT) & CARD_NO_DAY_MASK) as u8,
+        hour: ((card_no >> CARD_NO_HOUR_SHIFT) & CARD_NO_HOUR_MASK) as u8,
+        seq: (card_no & CARD_NO_SEQ_MASK) as u8,
     }
 }
 
@@ -215,10 +199,10 @@ pub fn next_stamp(current_card_no: u16, now: &CardIssuedAt) -> (CardIssuedAt, u8
             hour: stamp.hour,
             ..*now
         };
-        let mut nth = stamp.seq as u16 + 2;
+        let mut nth = u16::from(stamp.seq) + 2;
         if nth > 63 {
             nth = 1;
-            at = add_one_hour(&at);
+            at = add_one_hour(at);
         }
         return (at, nth as u8);
     }
@@ -233,11 +217,13 @@ pub fn next_stamp(current_card_no: u16, now: &CardIssuedAt) -> (CardIssuedAt, u8
 }
 
 /// 时刻 +1 小时，含跨日 / 跨月 / 跨年进位。
-fn add_one_hour(at: &CardIssuedAt) -> CardIssuedAt {
-    if at.hour < 23 {
+///
+/// `CardIssuedAt` 只有 8 字节，按值传递比按引用高效（避免一次间接寻址）。
+fn add_one_hour(at: CardIssuedAt) -> CardIssuedAt {
+    if at.hour < MAX_HOUR_OF_DAY {
         return CardIssuedAt {
             hour: at.hour + 1,
-            ..*at
+            ..at
         };
     }
     let (year, month, day) = next_day(at.year, at.month, at.day);
@@ -261,9 +247,10 @@ fn next_day(year: i32, month: u8, day: u8) -> (i32, u8, u8) {
 }
 
 /// 某年某月的天数。
+///
+/// 2 月按闰年规则返回 28/29；其余月份 4/6/9/11 为 30 天，其它为 31 天。
 fn days_in_month(year: i32, month: u8) -> u8 {
     match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
         2 => {
             let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
@@ -273,36 +260,44 @@ fn days_in_month(year: i32, month: u8) -> u8 {
                 28
             }
         }
-        _ => 30,
+        _ => 31,
     }
 }
 
 // ---------------------------------------------------------------- 入参校验
 
 /// 校验发卡时刻的取值范围。纯位宽/日历检查，不含业务规则。
-fn check_issued_at(at: &CardIssuedAt) -> DeviceResult<()> {
-    if !(2000..=2099).contains(&at.year) {
+///
+/// `CardIssuedAt` 只有 8 字节，按值传递比按引用高效。
+fn check_issued_at(at: CardIssuedAt) -> DeviceResult<()> {
+    if !(MIN_YEAR..=MAX_YEAR).contains(&at.year) {
         return Err(DeviceError::Param(format!(
-            "年份必须在 2000–2099，实际 {}",
+            "年份必须在 {MIN_YEAR}–{MAX_YEAR}，实际 {}",
             at.year
         )));
     }
-    if !(1..=12).contains(&at.month) {
-        return Err(DeviceError::Param(format!("月份必须是 1–12，实际 {}", at.month)));
-    }
-    if !(1..=31).contains(&at.day) {
-        return Err(DeviceError::Param(format!("日必须是 1–31，实际 {}", at.day)));
-    }
-    if at.hour > 23 {
+    if !(MIN_MONTH..=MAX_MONTH).contains(&at.month) {
         return Err(DeviceError::Param(format!(
-            "小时必须是 0–23，实际 {}",
+            "月份必须是 {MIN_MONTH}–{MAX_MONTH}，实际 {}",
+            at.month
+        )));
+    }
+    if !(1..=MAX_DAY_OF_MONTH).contains(&at.day) {
+        return Err(DeviceError::Param(format!(
+            "日必须是 1–{MAX_DAY_OF_MONTH}，实际 {}",
+            at.day
+        )));
+    }
+    if at.hour > MAX_HOUR_OF_DAY {
+        return Err(DeviceError::Param(format!(
+            "小时必须是 0–{MAX_HOUR_OF_DAY}，实际 {}",
             at.hour
         )));
     }
     Ok(())
 }
 
-/// 校验作业流水号：1–0xFFFF。`0` 不是合法卡号。
+/// 校验作业流水号：1–`0xFFFF`。`0` 不是合法卡号。
 fn check_card_no(card_no: u16) -> DeviceResult<u16> {
     if card_no == 0 {
         return Err(DeviceError::InvalidCardNo(card_no));
@@ -326,39 +321,41 @@ fn check_room_index(room_index: u16) -> DeviceResult<()> {
 pub type Pages = ([u8; 4], [u8; 4]);
 
 /// 组装页2（时长码 / 卡号低 / 卡号高 / 年月）。
-fn page2(duration_code: u8, card_no: u16, at: &CardIssuedAt) -> [u8; 4] {
+///
+/// 卡号**小端**写入：`[1]` = 低字节、`[2]` = 高字节。
+fn page2(duration_code: u8, card_no: u16, at: CardIssuedAt) -> [u8; PAGE_BYTES] {
     [
         duration_code,
-        (card_no & 0xFF) as u8,
-        ((card_no >> 8) & 0xFF) as u8,
-        year_month_byte(at),
+        (card_no & BYTE_MASK) as u8,
+        ((card_no >> CARD_NO_HIGH_SHIFT) & BYTE_MASK) as u8,
+        year_month_byte(&at),
     ]
 }
 
 /// 日租客卡。
 pub fn build_guest_day(spec: &GuestDaySpec) -> DeviceResult<Pages> {
     check_room_index(spec.room_index)?;
-    check_issued_at(&spec.issued_at)?;
-    if spec.days < 1 || spec.days > 1095 {
+    check_issued_at(spec.issued_at)?;
+    if spec.days < MIN_DAYS || spec.days > MAX_TOTAL_DAYS {
         return Err(DeviceError::Param(format!(
-            "天数必须在 1–1095，实际 {}",
+            "天数必须在 {MIN_DAYS}–{MAX_TOTAL_DAYS}，实际 {}",
             spec.days
         )));
     }
     let card_no = check_card_no(spec.card_no)?;
     let [b2, b3] = encode_room_index(spec.room_index, spec.lost)?;
     let p1 = [CARD_PREFIX[0], CARD_PREFIX[1], b2, b3];
-    let p2 = page2(duration_days_code(spec.days), card_no, &spec.issued_at);
+    let p2 = page2(duration_days_code(spec.days), card_no, spec.issued_at);
     Ok((p1, p2))
 }
 
 /// 钟点客卡。
 pub fn build_guest_hour(spec: &GuestHourSpec) -> DeviceResult<Pages> {
     check_room_index(spec.room_index)?;
-    check_issued_at(&spec.issued_at)?;
-    if spec.hours < 1 || spec.hours > 62 {
+    check_issued_at(spec.issued_at)?;
+    if spec.hours < MIN_HOURS || spec.hours > MAX_GUEST_HOURS {
         return Err(DeviceError::Param(format!(
-            "钟点客卡小时数必须在 1–62，实际 {}",
+            "钟点客卡小时数必须在 {MIN_HOURS}–{MAX_GUEST_HOURS}，实际 {}",
             spec.hours
         )));
     }
@@ -368,28 +365,28 @@ pub fn build_guest_hour(spec: &GuestHourSpec) -> DeviceResult<Pages> {
     let p2 = page2(
         duration_hours_code(spec.hours, true),
         card_no,
-        &spec.issued_at,
+        spec.issued_at,
     );
     Ok((p1, p2))
 }
 
 /// 总控卡。页1 固定 `5B EC F0 FF`（= 序号 4095）。小时编码不加 1。
 pub fn build_master(spec: &MasterSpec) -> DeviceResult<Pages> {
-    check_issued_at(&spec.issued_at)?;
+    check_issued_at(spec.issued_at)?;
     let card_no = check_card_no(spec.card_no)?;
     let duration_code = match spec.duration {
         CardDuration::Days(d) => {
-            if !(1..=1095).contains(&d) {
+            if !(MIN_DAYS..=MAX_TOTAL_DAYS).contains(&d) {
                 return Err(DeviceError::Param(format!(
-                    "总控卡天数必须在 1–1095，实际 {d}"
+                    "总控卡天数必须在 {MIN_DAYS}–{MAX_TOTAL_DAYS}，实际 {d}"
                 )));
             }
             duration_days_code(d)
         }
         CardDuration::Hours(h) => {
-            if !(1..=63).contains(&h) {
+            if !(MIN_HOURS..=MAX_HOURS_MASTER).contains(&h) {
                 return Err(DeviceError::Param(format!(
-                    "总控卡小时数必须在 1–63，实际 {h}"
+                    "总控卡小时数必须在 {MIN_HOURS}–{MAX_HOURS_MASTER}，实际 {h}"
                 )));
             }
             duration_hours_code(h, false)
@@ -401,7 +398,7 @@ pub fn build_master(spec: &MasterSpec) -> DeviceResult<Pages> {
         MASTER_PAGE1_TAIL[0],
         MASTER_PAGE1_TAIL[1],
     ];
-    Ok((p1, page2(duration_code, card_no, &spec.issued_at)))
+    Ok((p1, page2(duration_code, card_no, spec.issued_at)))
 }
 
 /// 安装卡。页2 固定 `46 F2 00 01`，**不占作业流水号**。
@@ -409,15 +406,18 @@ pub fn build_master(spec: &MasterSpec) -> DeviceResult<Pages> {
 /// 页1 低 4 位固定 `0x0C`，不是挂失标志——安装卡没有挂失概念。
 pub fn build_install(spec: &InstallSpec) -> DeviceResult<Pages> {
     check_room_index(spec.room_index)?;
-    let b2 = (((spec.room_index & 0x0F) as u8) << 4) | INSTALL_LOW_NIBBLE;
-    let b3 = ((spec.room_index >> 4) & 0xFF) as u8;
+    // 位打包与 `encode_room_index` 同构，但低 4 位是固定的 INSTALL_LOW_NIBBLE
+    // 而不是挂失标志——安装卡没有挂失概念。
+    let low_nibble = ((spec.room_index & ROOM_LOW_NIBBLE_MASK) as u8) << ROOM_LOW_NIBBLE_SHIFT;
+    let b2 = low_nibble | INSTALL_LOW_NIBBLE;
+    let b3 = ((spec.room_index >> ROOM_HIGH_SHIFT) & BYTE_MASK) as u8;
     let p1 = [CARD_PREFIX[0], CARD_PREFIX[1], b2, b3];
     Ok((p1, INSTALL_PAGE2))
 }
 
 /// 复位卡。页1 固定 `5B EC 0A 00`，页2 首字节 `0x00`。
 pub fn build_reset(spec: &PlainCardSpec) -> DeviceResult<Pages> {
-    check_issued_at(&spec.issued_at)?;
+    check_issued_at(spec.issued_at)?;
     let card_no = check_card_no(spec.card_no)?;
     let p1 = [
         CARD_PREFIX[0],
@@ -425,12 +425,12 @@ pub fn build_reset(spec: &PlainCardSpec) -> DeviceResult<Pages> {
         RESET_PAGE1_TAIL[0],
         RESET_PAGE1_TAIL[1],
     ];
-    Ok((p1, page2(0x00, card_no, &spec.issued_at)))
+    Ok((p1, page2(RESET_PAGE2_HEAD, card_no, spec.issued_at)))
 }
 
 /// 清除卡。页1 固定 `5B EC 9B E5`，页2 首字节 `0xC7`。
 pub fn build_clear(spec: &PlainCardSpec) -> DeviceResult<Pages> {
-    check_issued_at(&spec.issued_at)?;
+    check_issued_at(spec.issued_at)?;
     let card_no = check_card_no(spec.card_no)?;
     let p1 = [
         CARD_PREFIX[0],
@@ -438,12 +438,12 @@ pub fn build_clear(spec: &PlainCardSpec) -> DeviceResult<Pages> {
         CLEAR_PAGE1_TAIL[0],
         CLEAR_PAGE1_TAIL[1],
     ];
-    Ok((p1, page2(CLEAR_PAGE2_HEAD, card_no, &spec.issued_at)))
+    Ok((p1, page2(CLEAR_PAGE2_HEAD, card_no, spec.issued_at)))
 }
 
 /// 退房钟点设置卡。页1 = `5B EC 7B <hour>`，页2 首字节 `0xFF`。
 pub fn build_checkout_hour(spec: &CheckoutHourSpec) -> DeviceResult<Pages> {
-    check_issued_at(&spec.issued_at)?;
+    check_issued_at(spec.issued_at)?;
     let card_no = check_card_no(spec.card_no)?;
     if spec.hour > 23 {
         return Err(DeviceError::Param(format!(
@@ -457,7 +457,7 @@ pub fn build_checkout_hour(spec: &CheckoutHourSpec) -> DeviceResult<Pages> {
         CHECKOUT_HOUR_MARKER,
         spec.hour,
     ];
-    Ok((p1, page2(CHECKOUT_HOUR_PAGE2_HEAD, card_no, &spec.issued_at)))
+    Ok((p1, page2(CHECKOUT_HOUR_PAGE2_HEAD, card_no, spec.issued_at)))
 }
 
 /// 校时卡。页2 首字节固定 `0x06`（明文）。
@@ -472,7 +472,7 @@ pub fn build_checkout_hour(spec: &CheckoutHourSpec) -> DeviceResult<Pages> {
 /// 页1[2] 必须满足 `& 0x09 == 0x09`，否则读卡会返回错误 4。
 /// 早期按「16 × 当日分钟数 + 953」拟合的公式是错的，已废弃。
 pub fn build_timesync(spec: &TimeSyncSpec) -> DeviceResult<Pages> {
-    check_issued_at(&spec.issued_at)?;
+    check_issued_at(spec.issued_at)?;
     let card_no = check_card_no(spec.card_no)?;
     if spec.hour > 23 {
         return Err(DeviceError::Param(format!(
@@ -489,17 +489,20 @@ pub fn build_timesync(spec: &TimeSyncSpec) -> DeviceResult<Pages> {
     let p1 = [
         CARD_PREFIX[0],
         CARD_PREFIX[1],
-        16 * (spec.minute & 0x0F) + 9,
-        (spec.minute >> 4) + ((4 * spec.hour) & 0x7C),
+        // 页1[2] = TIMESYNC_MINUTE_LOW_FACTOR × (分 & 低4位) + OFFSET
+        // 其中 OFFSET 保证结果恒满足 `& TIMESYNC_PAGE1_REQUIRED_BITS == 该掩码`
+        TIMESYNC_MINUTE_LOW_FACTOR * (spec.minute & MINUTE_LOW_MASK) + TIMESYNC_MINUTE_LOW_OFFSET,
+        // 页1[3] = 分的高位 + 小时经 TIMESYNC_HOUR_FACTOR 倍乘后落在 TIMESYNC_HOUR_MASK 位上
+        (spec.minute >> MINUTE_HIGH_SHIFT) + ((TIMESYNC_HOUR_FACTOR * spec.hour) & TIMESYNC_HOUR_MASK),
     ];
-    Ok((p1, page2(TIMESYNC_PAGE2_HEAD, card_no, &spec.issued_at)))
+    Ok((p1, page2(TIMESYNC_PAGE2_HEAD, card_no, spec.issued_at)))
 }
 
 /// 擦卡用的全零页。
 ///
 /// 写零后 28 字节全零 = 空白卡，锁不再认它。
 /// **注意**：这不会让门锁里已有的授权消失。
-pub const ERASE_PAGES: Pages = ([0x00; 4], [0x00; 4]);
+pub const ERASE_PAGES: Pages = (ERASE_PAGE, ERASE_PAGE);
 
 /// 把页1/页2 拼成 28 字节卡数据（页3–7 恒为 0）。
 pub fn to_raw28(p1: &[u8; 4], p2: &[u8; 4]) -> [u8; crate::card::CARD_BYTES] {
@@ -510,6 +513,7 @@ pub fn to_raw28(p1: &[u8; 4], p2: &[u8; 4]) -> [u8; crate::card::CARD_BYTES] {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -523,7 +527,12 @@ mod tests {
     }
 
     fn hex4(b: [u8; 4]) -> String {
-        b.iter().map(|x| format!("{x:02X}")).collect()
+        let mut s = String::with_capacity(b.len() * 2);
+        for x in b {
+            s.push(crate::card::HEX_UPPER[(x >> 4) as usize] as char);
+            s.push(crate::card::HEX_UPPER[(x & 0x0F) as usize] as char);
+        }
+        s
     }
 
     // ------------------------------------------------ 年月字节
@@ -578,8 +587,12 @@ mod tests {
     fn days_1095_uses_bankers_rounding() {
         assert_eq!(1095 / 30, 36);
         assert_eq!(1095 % 30, 15, "1095/30 恰好余 15，命中 .5");
-        assert_eq!(duration_days_code(1095), 0xC0 | 36, "必须是 36 月");
-        assert_ne!(duration_days_code(1095), 0xC0 | 37, "四舍五入会得到 37，是错的");
+        assert_eq!(duration_days_code(1095), 0xC0 | 0x24, "必须是 36 月");
+        assert_ne!(
+            duration_days_code(1095),
+            0xC0 | 0x25,
+            "四舍五入会得到 37（0x25），是错的"
+        );
     }
 
     /// 天数 ≤63 走简单段，边界 1 与 63。

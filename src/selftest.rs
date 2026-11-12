@@ -337,7 +337,12 @@ const VECTORS: &[Vector] = &[
 ];
 
 fn hex4(b: [u8; 4]) -> String {
-    b.iter().map(|x| format!("{x:02X}")).collect()
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        s.push(crate::card::HEX_UPPER[(x >> 4) as usize] as char);
+        s.push(crate::card::HEX_UPPER[(x & 0x0F) as usize] as char);
+    }
+    s
 }
 
 /// 按向量描述构造页1/页2。
@@ -589,6 +594,7 @@ fn reverse_check(v: &Vector, p1: [u8; 4], p2: [u8; 4]) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

@@ -32,14 +32,18 @@
 //! 所以解析完后必须把非客卡的 `lost` 强制置 `false`，否则每张校时卡都会被读成"挂失卡"。
 
 use crate::builder::{
-    decode_timestamp_card_no, duration_days_code, duration_hours_code,
-    CHECKOUT_HOUR_MARKER, CLEAR_PAGE1_TAIL, INSTALL_PAGE2, MASTER_PAGE1_TAIL,
-    RESET_PAGE1_TAIL, TIMESYNC_PAGE2_HEAD, TIMESYNC_PAGE2_HEAD_LEGACY,
+    decode_timestamp_card_no, duration_days_code, duration_hours_code, CHECKOUT_HOUR_MARKER,
+    CLEAR_PAGE1_TAIL, INSTALL_PAGE2, MASTER_PAGE1_TAIL, RESET_PAGE1_TAIL, TIMESYNC_PAGE2_HEAD,
+    TIMESYNC_PAGE2_HEAD_LEGACY,
 };
 use crate::card::{
     decode_room_index, CardDuration, CardKind, CardSnapshot, CARD_BYTES, CARD_PREFIX,
 };
 use crate::error::{DeviceError, DeviceResult};
+use crate::protocol::{
+    CARD_NO_HIGH_SHIFT, DAYS_PER_MONTH, DAY_SIMPLE_PREFIX, DURATION_MASK, DURATION_SEGMENT_MASK,
+    HOUR_PREFIX, MAX_MONTH, MIN_MONTH, MONTH_MASK, MONTH_PREFIX,
+};
 
 /// 已退房标记：页2 = `12 12 12 12`。
 pub const CHECKED_OUT_MARKER: [u8; 4] = [0x12, 0x12, 0x12, 0x12];
@@ -131,15 +135,16 @@ pub fn parse(raw: &[u8]) -> DeviceResult<CardSnapshot> {
 
 /// 按时长码首字节解出时长。
 ///
-/// - `0xC_` → 月编码（`(b & 0x3F) × 30` 天）
-/// - `0x4_` → 小时编码（客卡要再减 1，见调用方）
-/// - `0x8_` → 天数编码（`b & 0x3F` 天）
+/// - `0xC_` 段 → 月编码（`(b & DURATION_MASK) × DAYS_PER_MONTH` 天）
+/// - `0x4_` 段 → 小时编码（客卡要再减 1，见调用方）
+/// - `0x8_` 段 → 天数编码（`b & DURATION_MASK` 天）
 /// - 其它 → `None`（不属于客卡/总控卡的时长段）
 fn decode_duration(byte: u8) -> Option<CardDuration> {
-    match byte & 0xC0 {
-        0xC0 => Some(CardDuration::Days((byte & 0x3F) as u16 * 30)),
-        0x40 => Some(CardDuration::Hours((byte & 0x3F) as u16)),
-        0x80 => Some(CardDuration::Days((byte & 0x3F) as u16)),
+    let value = u16::from(byte & DURATION_MASK);
+    match byte & DURATION_SEGMENT_MASK {
+        MONTH_PREFIX => Some(CardDuration::Days(value * DAYS_PER_MONTH)),
+        HOUR_PREFIX => Some(CardDuration::Hours(value)),
+        DAY_SIMPLE_PREFIX => Some(CardDuration::Days(value)),
         _ => None,
     }
 }
@@ -166,9 +171,10 @@ fn snapshot(kind: CardKind, raw: [u8; CARD_BYTES]) -> CardSnapshot {
 fn with_card_no(kind: CardKind, raw: [u8; CARD_BYTES]) -> CardSnapshot {
     let mut snap = snapshot(kind, raw);
     let ym = raw[7];
-    let month = ym & 0x0F;
-    if (1..=12).contains(&month) {
-        let card_no = ((raw[6] as u16) << 8) | raw[5] as u16;
+    let month = ym & MONTH_MASK;
+    if (MIN_MONTH..=MAX_MONTH).contains(&month) {
+        // 卡号小端存放：raw[5] = 低字节、raw[6] = 高字节
+        let card_no = (u16::from(raw[6]) << CARD_NO_HIGH_SHIFT) | u16::from(raw[5]);
         if card_no != 0 {
             snap.card_no = Some(card_no);
             snap.stamp = Some(decode_timestamp_card_no(card_no));
@@ -186,6 +192,7 @@ pub fn encode_duration(duration: CardDuration, guest: bool) -> u8 {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::builder::CLEAR_PAGE2_HEAD;
@@ -196,7 +203,12 @@ mod tests {
     }
 
     fn hex4(b: [u8; 4]) -> String {
-        b.iter().map(|x| format!("{x:02X}")).collect()
+        let mut s = String::with_capacity(b.len() * 2);
+        for x in b {
+            s.push(crate::card::HEX_UPPER[(x >> 4) as usize] as char);
+            s.push(crate::card::HEX_UPPER[(x & 0x0F) as usize] as char);
+        }
+        s
     }
 
     // ------------------------------------------------ 基础分支
