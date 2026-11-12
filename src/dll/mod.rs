@@ -41,6 +41,7 @@ pub mod arch;
 pub mod device;
 pub mod pe;
 pub mod timing;
+pub mod timeout;
 
 pub use arch::{
     build_target_matches_driver, EXPECTED_DRIVER_ARCH, KNOWN_DRIVER_BYTES, KNOWN_DRIVER_SHA256,

@@ -34,7 +34,7 @@
 #![allow(unsafe_code)]
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::builder;
@@ -46,9 +46,11 @@ use crate::card::{
 use crate::card_device::CardDevice;
 use crate::dll::arch::KNOWN_DRIVER_SHA256;
 use crate::dll::timing::{
-    CONFIG_SETTLE_MS, OPEN_SETTLE_MS, RESHAKE_DELAY_MS, SETUP_PWM_DELAY_MS, VERIFY_RETRY_DELAY_MS,
-    WRITE_PAGE1_DELAY_MS, WRITE_PAGE2_DELAY_MS,
+    CLEANUP_TIMEOUT_MS, CONFIG_SETTLE_MS, OPEN_SETTLE_MS, OPEN_TIMEOUT_MS, PROBE_PORT_TIMEOUT_MS,
+    READ_TIMEOUT_MS, RESHAKE_DELAY_MS, SETUP_PWM_DELAY_MS, VERIFY_RETRY_DELAY_MS,
+    WRITE_PAGE1_DELAY_MS, WRITE_PAGE2_DELAY_MS, WRITE_TIMEOUT_MS,
 };
+use crate::dll::timeout::run_with_timeout;
 use crate::dll::{c_string_bytes, page_to_hex, pe, DllExports};
 use crate::error::{DeviceError, DeviceResult};
 use crate::parser;
@@ -75,6 +77,12 @@ pub struct DirectDllDevice {
     driver_dir: PathBuf,
     /// 驱动与串口状态。`Mutex` 串行化全部驱动调用（串口是独占资源）。
     state: Mutex<SessionState>,
+    /// 串行化「打开序列」。
+    ///
+    /// 打开过程包含多次驱动调用、总耗时约 1 秒，期间不能持有 `state` 锁——
+    /// 否则超时机制无法工作（见 [`crate::dll::timeout`]：驱动调用要放到工作线程里，
+    /// 而工作线程再去抢 `state` 锁就会死锁）。这里用一把独立的轻量锁串行打开动作。
+    open_lock: Mutex<()>,
 }
 
 /// 会话状态：已加载的驱动 + 是否已打开 + 当前端口。
@@ -82,11 +90,19 @@ pub struct DirectDllDevice {
 /// 端口放在状态里而不是 `&self` 的不可变字段上，因为 [`CardDevice::set_port`]
 /// 需要在 `&self` 下切换端口。
 struct SessionState {
-    dll: Option<DllExports>,
+    /// 驱动句柄。**必须是 `Arc`**：超时后工作线程仍卡在驱动里，
+    /// 若主线程在这里 drop 掉句柄，`Library` 会被卸载，而那个线程还在里面执行——
+    /// 那是崩溃级的未定义行为。`Arc` 让句柄活到最后一个线程退出为止。
+    dll: Option<Arc<DllExports>>,
     opened: bool,
     reader_id: Option<String>,
     /// 当前串口索引 0–7。
     port: u8,
+    /// 会话是否已变得不可信；`Some(原因)` 时后续调用一律拒绝。
+    ///
+    /// 只有超时会让会话变成不可信——因为超时意味着「我们不知道驱动做了什么，
+    /// 也不知道它会不会返回」。此后继续下发命令，会让两个线程同时操作同一个串口。
+    untrusted: Option<String>,
 }
 
 impl SessionState {
@@ -96,6 +112,7 @@ impl SessionState {
             opened: false,
             reader_id: None,
             port,
+            untrusted: None,
         }
     }
 }
@@ -110,6 +127,7 @@ impl DirectDllDevice {
         Self {
             driver_dir: driver_dir.into(),
             state: Mutex::new(SessionState::closed(6)),
+            open_lock: Mutex::new(()),
         }
     }
 
@@ -158,122 +176,262 @@ impl DirectDllDevice {
             .map_err(|_| DeviceError::Io("设备会话锁已中毒，请重启程序".to_string()))
     }
 
-    /// 确保驱动已加载且串口已打开。
-    fn ensure_open(&self) -> DeviceResult<std::sync::MutexGuard<'_, SessionState>> {
-        let mut st = self.lock()?;
-        if st.opened {
-            return Ok(st);
+    /// 会话若已被标记为不可信，返回拒绝原因。
+    ///
+    /// 超时之后**绝不能**继续下发命令：工作线程可能仍卡在驱动里，
+    /// 此时再来一条命令会让两个线程同时操作同一个串口——那是会把卡写坏的情形。
+    fn reject_if_untrusted(st: &SessionState) -> DeviceResult<()> {
+        match &st.untrusted {
+            Some(reason) => Err(DeviceError::SessionUntrusted(format!(
+                "{reason}。请关闭程序后重新启动——继续操作可能把卡写坏。"
+            ))),
+            None => Ok(()),
         }
-
-        // 加载驱动（已加载则复用）
-        if st.dll.is_none() {
-            st.dll = Some(DllExports::load(&self.driver_path())?);
-        }
-        let dll = st
-            .dll
-            .as_ref()
-            .ok_or_else(|| DeviceError::DriverNotLoaded("驱动句柄丢失".to_string()))?;
-
-        // ---- 打开序列，逐个延时都是实测必需 ----
-        if dll.open_port(i32::from(st.port), i32::try_from(SERIAL_BAUD).unwrap_or(i32::MAX)) != 0 {
-            st.dll = None;
-            return Err(DeviceError::PortOpenFailed { port: st.port });
-        }
-        sleep_ms(OPEN_SETTLE_MS);
-
-        // 握手；首次失败说明读卡器可能处于加扰模式，重新配置后再试一次
-        let mut rc = dll.handshake();
-        if rc != 0 {
-            let _ = dll.set_config(CONFIG_MODE_PLAIN);
-            sleep_ms(RESHAKE_DELAY_MS);
-            rc = dll.handshake();
-        }
-        // 两次都失败：读卡器没插好或没供电（原 C# 此处同样不立即返回，
-        // 而是继续走配置+握手，靠后面的 selecard 兜底——实测这样更稳）
-        let handshake_ok = rc == 0;
-
-        // 明文模式：必须在写卡前设置，否则"能读不能写"
-        let _ = dll.set_config(CONFIG_MODE_PLAIN);
-        sleep_ms(CONFIG_SETTLE_MS);
-        let _ = dll.handshake();
-
-        // 选 TEMIC 卡型；卡不在读卡器上时这里会失败。
-        // 握手彻底失败时也走这个分支：两种情况下驱动都拿不到卡，
-        // 现场看到的都是"读不到卡"，统一报 NoCard 反而更贴近事实。
-        if dll.select_card(CARD_TYPE_TEMIC) != 0 {
-            dll.close_port();
-            st.dll = None;
-            // 握手都没成功时，更可能是读卡器没连好而不是没放卡
-            if !handshake_ok {
-                return Err(DeviceError::HandshakeFailed);
-            }
-            return Err(DeviceError::NoCard);
-        }
-
-        st.reader_id = dll.reader_id();
-        st.opened = true;
-        Ok(st)
     }
 
-    /// 读卡的原始 28 字节。
-    fn read_raw(st: &SessionState) -> DeviceResult<[u8; CARD_BYTES]> {
-        let dll = st
-            .dll
-            .as_ref()
-            .ok_or(DeviceError::NotOpen)?;
-        let (rc, hex) = dll.read_card_hex();
-        if rc != 0 {
-            return Err(DeviceError::ReadFailed(format!("驱动返回 {rc}")));
+    /// 把会话标记为不可信。只在驱动调用超时后调用。
+    fn mark_untrusted(&self, reason: &str) {
+        if let Ok(mut st) = self.state.lock() {
+            st.untrusted = Some(reason.to_string());
+            // 不再相信串口状态：既不能读也不能写
+            st.opened = false;
         }
-        parse_hex28(&hex)
+    }
+
+    /// 取驱动句柄，必要时加载。返回 `Arc` 以便跨线程使用。
+    ///
+    /// 加载动作本身也可能卡住（`LoadLibrary` 要读文件），但它发生在持有 `state` 锁时，
+    /// 无法用超时机制包住——这是已知的残余风险，已记录在 TD-018 的「遗留」里。
+    fn dll_handle(&self) -> DeviceResult<Arc<DllExports>> {
+        let mut st = self.lock()?;
+        Self::reject_if_untrusted(&st)?;
+        if let Some(dll) = &st.dll {
+            return Ok(Arc::clone(dll));
+        }
+        let dll = Arc::new(DllExports::load(&self.driver_path())?);
+        st.dll = Some(Arc::clone(&dll));
+        Ok(dll)
+    }
+
+    /// 确保驱动已加载且串口已打开，返回可跨线程使用的驱动句柄。
+    ///
+    /// # 为什么返回 `Arc` 而不是 `MutexGuard`
+    ///
+    /// 打开序列本身要在工作线程里跑（带超时），工作线程必须是 `'static`。
+    /// `MutexGuard` 借用 `&self`，跨不了线程；`Arc<DllExports>` 可以克隆进去。
+    ///
+    /// 这也顺带避免了「持锁做驱动调用」——那样超时机制根本无法生效。
+    fn ensure_open(&self) -> DeviceResult<Arc<DllExports>> {
+        // 快速路径：已打开就直接复用
+        {
+            let st = self.lock()?;
+            Self::reject_if_untrusted(&st)?;
+            if st.opened {
+                if let Some(dll) = &st.dll {
+                    return Ok(Arc::clone(dll));
+                }
+            }
+        }
+
+        // 打开动作串行化，避免两个线程同时打开同一个串口
+        let _open_guard = self
+            .open_lock
+            .lock()
+            .map_err(|_| DeviceError::Io("打开锁已中毒，请重启程序".to_string()))?;
+
+        // 二次检查：等锁期间别人可能已经打开了
+        let port = {
+            let st = self.lock()?;
+            Self::reject_if_untrusted(&st)?;
+            if st.opened {
+                if let Some(dll) = &st.dll {
+                    return Ok(Arc::clone(dll));
+                }
+            }
+            st.port
+        };
+
+        let dll = self.dll_handle()?;
+        let dll_for_thread = Arc::clone(&dll);
+
+        // 打开序列整体带超时：里面有三段 sleep 与四次驱动调用
+        let outcome = run_with_timeout("打开读卡器", OPEN_TIMEOUT_MS, move || {
+            open_sequence(&dll_for_thread, port)
+        });
+
+        match outcome {
+            Ok(reader_id) => {
+                let mut st = self.lock()?;
+                st.opened = true;
+                st.reader_id = reader_id;
+                Ok(dll)
+            }
+            Err(e @ DeviceError::Timeout(_)) => {
+                // 超时：驱动可能仍卡在工作线程里，串口状态未知
+                self.mark_untrusted("打开读卡器超时");
+                Err(e)
+            }
+            Err(e) => {
+                // 正常失败（无卡、握手失败等）：驱动已返回，句柄仍然可信
+                let mut st = self.lock()?;
+                st.dll = None;
+                Err(e)
+            }
+        }
+    }
+
+    /// 读卡的原始 28 字节（带超时）。
+    fn read_raw(&self, dll: &Arc<DllExports>) -> DeviceResult<[u8; CARD_BYTES]> {
+        let dll = Arc::clone(dll);
+        let outcome = run_with_timeout("读卡", READ_TIMEOUT_MS, move || read_sequence(&dll));
+        match outcome {
+            Err(e @ DeviceError::Timeout(_)) => {
+                self.mark_untrusted("读卡超时");
+                Err(e)
+            }
+            other => other,
+        }
     }
 
     /// 写卡核心：设置密码 → 写页1 → 写页2 → 回读校验。
     ///
     /// 页数据已由 `builder` 构造好，这里只负责"把它写进卡并确认写进去了"。
+    ///
+    /// # 整条序列作为一个整体超时
+    ///
+    /// **不能**把每个驱动调用分别超时：那样一旦中途超时，我们既不知道写到哪一步，
+    /// 又还能继续下发后续命令。整条写卡序列放进一个工作线程、共享一个总超时，
+    /// 中途卡死就整体失败并隔离会话——这才是安全的行为。
     fn write_pages(
         &self,
         p1: [u8; 4],
         p2: [u8; 4],
         room_index: Option<u16>,
     ) -> DeviceResult<CardSnapshot> {
-        let st = self.ensure_open()?;
-        let dll = st.dll.as_ref().ok_or(DeviceError::NotOpen)?;
+        let dll = self.ensure_open()?;
 
-        let pwd = c_string_bytes(WRITE_PASSWORD);
+        let outcome = run_with_timeout("写卡", WRITE_TIMEOUT_MS, move || {
+            write_sequence(&dll, p1, p2)
+        });
 
-        if dll.setup_write_password(&pwd) != 0 {
-            return Err(DeviceError::WriteFailed("设置写密码失败".to_string()));
-        }
-        sleep_ms(SETUP_PWM_DELAY_MS);
+        let raw = match outcome {
+            Ok(raw) => raw,
+            Err(e @ DeviceError::Timeout(_)) => {
+                // 卡可能只写了一半，且驱动可能仍卡着。隔离会话，等人工处理。
+                self.mark_untrusted("写卡超时，卡内容未知");
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
 
-        if dll.write_page(1, &pwd, c_string_bytes(&page_to_hex(p1)).as_slice()) != 0 {
-            return Err(DeviceError::WriteFailed("写页1 失败".to_string()));
-        }
-        sleep_ms(WRITE_PAGE1_DELAY_MS);
-
-        if dll.write_page(2, &pwd, c_string_bytes(&page_to_hex(p2)).as_slice()) != 0 {
-            return Err(DeviceError::WriteFailed("写页2 失败".to_string()));
-        }
-        sleep_ms(WRITE_PAGE2_DELAY_MS);
-
-        // 回读校验：写完立刻读可能拿到旧值（实测结论），所以最多试 3 次。
-        // 重试是**协议的一部分**，不是容错；整次写卡绝不因此重来。
-        let raw = verify_written(
-            || Self::read_raw(&st),
-            p1,
-            p2,
-            VERIFY_ATTEMPTS,
-            VERIFY_RETRY_DELAY_MS,
-        )?;
-
-        dll.beep_times(2);
         let mut snap = parser::parse(&raw)?;
         if let Some(idx) = room_index {
             snap.room_index = Some(idx);
         }
         Ok(snap)
     }
+}
+
+/// 打开序列：打开串口 → 握手 → 明文模式 → 选卡。
+///
+/// 整段作为**一个工作线程任务**执行，由 [`run_with_timeout`] 兜底超时。
+/// 这就是为什么它是一个自由函数而不是 `DirectDllDevice` 的方法：
+/// 工作线程要求 `'static`，方法借用 `&self` 跨不过去。
+///
+/// 返回读卡器序列号（取不到时为 `None`，不致命）。
+fn open_sequence(dll: &DllExports, port: u8) -> DeviceResult<Option<String>> {
+    if dll.open_port(i32::from(port), i32::try_from(SERIAL_BAUD).unwrap_or(i32::MAX)) != 0 {
+        return Err(DeviceError::PortOpenFailed { port });
+    }
+    sleep_ms(OPEN_SETTLE_MS);
+
+    // 握手；首次失败说明读卡器可能处于加扰模式，重新配置后再试一次
+    let mut rc = dll.handshake();
+    if rc != 0 {
+        let _ = dll.set_config(CONFIG_MODE_PLAIN);
+        sleep_ms(RESHAKE_DELAY_MS);
+        rc = dll.handshake();
+    }
+    // 两次都失败：读卡器没插好或没供电（原 C# 此处同样不立即返回，
+    // 而是继续走配置+握手，靠后面的 selecard 兜底——实测这样更稳）
+    let handshake_ok = rc == 0;
+
+    // 明文模式：必须在写卡前设置，否则"能读不能写"
+    let _ = dll.set_config(CONFIG_MODE_PLAIN);
+    sleep_ms(CONFIG_SETTLE_MS);
+    let _ = dll.handshake();
+
+    // 选 TEMIC 卡型；卡不在读卡器上时这里会失败。
+    // 握手彻底失败时也走这个分支：两种情况下驱动都拿不到卡，
+    // 现场看到的都是"读不到卡"，统一报 NoCard 反而更贴近事实。
+    if dll.select_card(CARD_TYPE_TEMIC) != 0 {
+        dll.close_port();
+        // 握手都没成功时，更可能是读卡器没连好而不是没放卡
+        if !handshake_ok {
+            return Err(DeviceError::HandshakeFailed);
+        }
+        return Err(DeviceError::NoCard);
+    }
+
+    Ok(dll.reader_id())
+}
+
+/// 读一次卡的原始 28 字节。
+///
+/// 同一份逻辑既给 [`CardDevice::read_card`] 用，也给写卡后的回读校验用——
+/// 两处必须走完全相同的路径，否则「读卡能读、校验读不出」这种偏差会很难查。
+fn read_sequence(dll: &DllExports) -> DeviceResult<[u8; CARD_BYTES]> {
+    let (rc, hex) = dll.read_card_hex();
+    if rc != 0 {
+        return Err(DeviceError::ReadFailed(format!("驱动返回 {rc}")));
+    }
+    parse_hex28(&hex)
+}
+
+/// 整条写卡序列：设置密码 → 写页1 → 写页2 → 回读校验 → 蜂鸣。
+///
+/// 返回**读回的** 28 字节（校验通过的那一次），供调用方解析。
+///
+/// # 为什么整条序列一起超时
+///
+/// 序列内部的每一步都依赖上一步的结果（没设密码写不了页，没写页2 无法校验）。
+/// 若按步单独超时，中途卡住时我们既不知道进行到哪一步，又还能继续下发后续命令。
+/// 所以整条序列放进一个工作线程、共享一个总超时：卡住就整体失败并隔离会话。
+fn write_sequence(
+    dll: &DllExports,
+    p1: [u8; 4],
+    p2: [u8; 4],
+) -> DeviceResult<[u8; CARD_BYTES]> {
+    let pwd = c_string_bytes(WRITE_PASSWORD);
+
+    if dll.setup_write_password(&pwd) != 0 {
+        return Err(DeviceError::WriteFailed("设置写密码失败".to_string()));
+    }
+    sleep_ms(SETUP_PWM_DELAY_MS);
+
+    if dll.write_page(1, &pwd, &c_string_bytes(&page_to_hex(p1))) != 0 {
+        return Err(DeviceError::WriteFailed("写页1 失败".to_string()));
+    }
+    sleep_ms(WRITE_PAGE1_DELAY_MS);
+
+    if dll.write_page(2, &pwd, &c_string_bytes(&page_to_hex(p2))) != 0 {
+        return Err(DeviceError::WriteFailed("写页2 失败".to_string()));
+    }
+    sleep_ms(WRITE_PAGE2_DELAY_MS);
+
+    // 回读校验：写完立刻读可能拿到旧值（实测结论），所以最多试 3 次。
+    // 重试是**协议的一部分**，不是容错；整次写卡绝不因此重来。
+    let raw = verify_written(
+        || read_sequence(dll),
+        p1,
+        p2,
+        VERIFY_ATTEMPTS,
+        VERIFY_RETRY_DELAY_MS,
+    )?;
+
+    // 只有校验通过才响——写失败时蜂鸣会让前台误以为成功了
+    dll.beep_times(2);
+    Ok(raw)
 }
 
 /// 回读校验：反复读卡，直到页1/页2 与刚写入的一致，或次数用尽。
@@ -327,21 +485,40 @@ where
 
 impl CardDevice for DirectDllDevice {
     fn open(&self) -> DeviceResult<()> {
-        let mut st = self.ensure_open()?;
-        // ensure_open 已置 opened；这里只是消耗掉 guard
-        st.opened = true;
+        // `ensure_open` 内部已把会话置为 opened 并记录读卡器序列号，
+        // 这里只需要驱动一次打开动作、丢弃句柄。
+        let _dll = self.ensure_open()?;
         Ok(())
     }
 
     fn close(&self) -> DeviceResult<()> {
-        let mut st = self.lock()?;
-        if let Some(dll) = st.dll.as_ref() {
+        // 先把状态改掉、取出句柄，**不持锁做驱动调用**——
+        // 持锁调用正是 TD-018 要消除的模式：驱动卡住时会把所有后续调用一起堵死。
+        let dll = {
+            let mut st = self.lock()?;
+            let dll = st.dll.as_ref().map(Arc::clone);
+            st.opened = false;
+            st.reader_id = None;
+            // 保留 dll 句柄以便快速重开；真正卸载要 drop
+            dll
+        };
+
+        let Some(dll) = dll else {
+            return Ok(());
+        };
+
+        match run_with_timeout("关闭串口", CLEANUP_TIMEOUT_MS, move || {
             dll.close_port();
+            Ok(())
+        }) {
+            Ok(()) => Ok(()),
+            Err(e @ DeviceError::Timeout(_)) => {
+                // 关闭都能卡住，说明驱动状态已经不可信
+                self.mark_untrusted("关闭串口超时");
+                Err(e)
+            }
+            Err(e) => Err(e),
         }
-        st.opened = false;
-        st.reader_id = None;
-        // 保留 dll 句柄以便快速重开；真正卸载要 drop
-        Ok(())
     }
 
     fn is_open(&self) -> bool {
@@ -349,8 +526,8 @@ impl CardDevice for DirectDllDevice {
     }
 
     fn read_card(&self) -> DeviceResult<CardSnapshot> {
-        let st = self.ensure_open()?;
-        let raw = Self::read_raw(&st)?;
+        let dll = self.ensure_open()?;
+        let raw = self.read_raw(&dll)?;
         parser::parse(&raw)
     }
 
@@ -423,14 +600,31 @@ impl CardDevice for DirectDllDevice {
                 "串口索引必须在 0–{MAX_PORT_INDEX}，实际 {port}"
             )));
         }
-        let mut st = self.lock()?;
+
+        // 同样先改状态再关旧串口，避免持锁调用驱动
+        let dll = {
+            let mut st = self.lock()?;
+            let dll = st.dll.as_ref().map(Arc::clone);
+            st.opened = false;
+            st.reader_id = None;
+            st.port = port;
+            dll
+        };
+
         // 换端口前先关掉旧串口，避免占着不放
-        if let Some(dll) = st.dll.as_ref() {
-            dll.close_port();
+        if let Some(dll) = dll {
+            // 超时要隔离会话；其余失败都不阻止换端口——新端口会重新打开，
+            // 旧句柄关不掉不影响这个结果
+            if let Err(e @ DeviceError::Timeout(_)) =
+                run_with_timeout("关闭串口", CLEANUP_TIMEOUT_MS, move || {
+                    dll.close_port();
+                    Ok(())
+                })
+            {
+                self.mark_untrusted("换端口时关闭串口超时");
+                return Err(e);
+            }
         }
-        st.opened = false;
-        st.reader_id = None;
-        st.port = port;
         Ok(())
     }
 
@@ -467,13 +661,38 @@ impl CardDevice for DirectDllDevice {
 /// 现场就会去拔线重插,而其实只是没放卡。
 ///
 /// 返回 `(是否可用, 序列号, 失败原因)`。
+///
+/// 整个探测序列带超时：`probe_ports` 要挨个试 8 个端口，某个端口上的读卡器
+/// 若半死不活（插着但固件卡死），没有超时就会让「探测」本身变成不可用的操作。
 fn probe_port_once(driver_dir: &Path, port: u8) -> (bool, Option<String>, Option<String>) {
     let path = driver_dir.join(DRIVER_FILE);
     let dll = match DllExports::load(&path) {
-        Ok(d) => d,
+        Ok(d) => Arc::new(d),
         Err(e) => return (false, None, Some(e.to_string())),
     };
 
+    let dll_for_thread = Arc::clone(&dll);
+    match run_with_timeout("探测串口", PROBE_PORT_TIMEOUT_MS, move || {
+        Ok(probe_sequence(&dll_for_thread, port))
+    }) {
+        Ok(outcome) => outcome,
+        Err(DeviceError::Timeout(_)) => (
+            false,
+            None,
+            Some(format!(
+                "串口 COM{} 探测超时（{PROBE_PORT_TIMEOUT_MS} ms 无响应）",
+                u16::from(port) + 1
+            )),
+        ),
+        Err(e) => (false, None, Some(e.to_string())),
+    }
+}
+
+/// 在已加载的驱动上跑一次探测序列。**不带超时**，由调用方包。
+fn probe_sequence(
+    dll: &DllExports,
+    port: u8,
+) -> (bool, Option<String>, Option<String>) {
     if dll.open_port(i32::from(port), i32::try_from(SERIAL_BAUD).unwrap_or(i32::MAX)) != 0 {
         return (
             false,
@@ -766,6 +985,124 @@ mod tests {
         assert_eq!(info.backend, DeviceBackend::DirectDll);
         assert!(!info.opened);
         assert_eq!(info.baud, SERIAL_BAUD);
+    }
+
+    // ------------------------------------------------- 超时与会话隔离（TD-018）
+
+    /// 新会话是可信的，`reject_if_untrusted` 放行。
+    #[test]
+    fn fresh_session_is_trusted() {
+        let st = SessionState::closed(2);
+        assert!(st.untrusted.is_none());
+        assert!(DirectDllDevice::reject_if_untrusted(&st).is_ok());
+    }
+
+    /// 标记不可信之后，后续调用必须被拒绝，且错误文案要求重启程序。
+    ///
+    /// 这是 TD-018 最关键的行为：超时后驱动可能仍卡在工作线程里，
+    /// 此时继续下发命令会让两个线程同时操作同一个串口。
+    #[test]
+    fn untrusted_session_rejects_further_calls() {
+        let st = SessionState {
+            untrusted: Some("读卡超时".to_string()),
+            ..SessionState::closed(2)
+        };
+
+        let err = DirectDllDevice::reject_if_untrusted(&st)
+            .expect_err("不可信会话必须拒绝调用");
+
+        assert_eq!(err.kind(), "session_untrusted");
+        assert_eq!(err.sdk_code(), -1, "这不是 SDK 语义码");
+        assert!(err.is_device_fault(), "应被当作设备故障标红");
+        let text = err.to_string();
+        assert!(text.contains("读卡超时"), "应带原始超时原因：{text}");
+        assert!(text.contains("重新启动") || text.contains("关闭程序"), "应告诉用户怎么办：{text}");
+        assert!(err.hint().contains("卡写坏"), "提示要说清风险：{}", err.hint());
+    }
+
+    /// 标记不可信时必须同时把 `opened` 置 false——串口状态已不可信。
+    #[test]
+    fn marking_untrusted_clears_opened() {
+        let dev = DirectDllDevice::new("C:/nonexistent-driver-dir");
+        {
+            let mut st = dev.state.lock().expect("取锁");
+            st.opened = true;
+            st.reader_id = Some("SN1".to_string());
+        }
+        assert!(dev.is_open());
+
+        dev.mark_untrusted("写卡超时，卡内容未知");
+
+        assert!(!dev.is_open(), "不可信之后不该再认为串口是打开的");
+        let st = dev.state.lock().expect("取锁");
+        assert!(st.untrusted.is_some());
+        assert!(st
+            .untrusted
+            .as_deref()
+            .is_some_and(|r| r.contains("写卡超时")));
+    }
+
+    /// 已标记不可信的设备，任何读写都必须先失败，不再碰驱动。
+    ///
+    /// 用不存在的驱动目录构造：若真去碰驱动，会先报 `DriverFileMissing`。
+    /// 现在应先报 `SessionUntrusted`，证明拒绝检查发生在驱动调用之前。
+    #[test]
+    fn untrusted_device_fails_before_touching_driver() {
+        let dev = DirectDllDevice::new("C:/nonexistent-driver-dir");
+        dev.mark_untrusted("打开读卡器超时");
+
+        let err = dev.read_card().expect_err("不可信设备不能读卡");
+        assert_eq!(
+            err.kind(),
+            "session_untrusted",
+            "应报会话失效，而不是驱动缺失：{err}"
+        );
+
+        let err = dev
+            .write_install(&InstallSpec { room_index: 1 })
+            .expect_err("不可信设备不能写卡");
+        assert_eq!(err.kind(), "session_untrusted");
+    }
+
+    /// **端到端**：永不返回的假驱动调用 → 超时 → 会话隔离 → 后续调用被拒。
+    ///
+    /// 前一刻的行为来自 [`run_with_timeout`]，后一刻来自 `mark_untrusted` +
+    /// `reject_if_untrusted`。这里把两端接起来验证，因为「超时了但没人去隔离」
+    /// 正是这个机制最容易出现的失效方式——单看任何一半都是对的。
+    #[test]
+    fn timeout_poisons_session_and_blocks_follow_up() {
+        let dev = DirectDllDevice::new("C:/nonexistent-driver-dir");
+
+        // 1) 假驱动调用：永不返回（模拟卡在 DLL 里）
+        let err = run_with_timeout("读卡", 80, || -> DeviceResult<[u8; CARD_BYTES]> {
+            std::thread::sleep(Duration::from_secs(5));
+            Ok([0u8; CARD_BYTES])
+        })
+        .expect_err("永不返回必须超时");
+        assert!(matches!(err, DeviceError::Timeout(_)));
+
+        // 2) 按约定隔离会话
+        dev.mark_untrusted("读卡超时");
+
+        // 3) 后续调用一律拒绝，且拒绝发生在碰驱动之前
+        for label in ["读卡", "写安装卡"] {
+            let e = if label == "读卡" {
+                dev.read_card().expect_err("不可信会话不能读")
+            } else {
+                dev.write_install(&InstallSpec { room_index: 1 })
+                    .expect_err("不可信会话不能写")
+            };
+            assert_eq!(e.kind(), "session_untrusted", "{label} 应被拒绝：{e}");
+        }
+
+        // 4) 会话仍然不可信——隔离是持久的，不会自己恢复
+        assert!(dev
+            .state
+            .lock()
+            .expect("取锁")
+            .untrusted
+            .as_deref()
+            .is_some_and(|r| r.contains("读卡超时")));
     }
 
     // ---------------------------------------------------------- 回读校验（TD-005）

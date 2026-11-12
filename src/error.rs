@@ -130,6 +130,16 @@ pub enum DeviceError {
     #[error("卡号状态文件读写失败：{0}")]
     StateFile(String),
 
+    /// 设备会话已失效，必须重启程序。
+    ///
+    /// 触发条件：某次驱动调用超时。超时后我们**不知道驱动做了什么，也不知道它会不会
+    /// 返回**——工作线程可能仍卡在 DLL 里。此时继续下发命令会让两个线程同时操作
+    /// 同一个串口，那是会把卡写坏的情形。所以会话被标记为不可信，后续调用一律拒绝。
+    ///
+    /// 这不是「重试就能好」的错误，`hint()` 会明确要求关闭程序重开。
+    #[error("设备会话已失效：{0}")]
+    SessionUntrusted(String),
+
     // ---------------- 硬件层自有故障（sdk_code() == -1） ----------------
     /// 驱动文件不存在。
     ///
@@ -165,7 +175,13 @@ pub enum DeviceError {
     /// 操作超时。
     ///
     /// 触发条件：驱动调用在规定时间内没有返回。驱动是同步阻塞调用，
-    /// 实现侧需用超时机制兜底，避免界面永久卡死。
+    /// 由 [`crate::dll::timeout::run_with_timeout`] 兜底，避免界面永久卡死。
+    ///
+    /// **注意参数单位是秒**（展示文案写死了「N 秒」）。传毫秒会显示成
+    /// 「超时（10000 秒）」，差三个数量级。
+    ///
+    /// 超时之后会话会被标记为不可信（见 [`Self::SessionUntrusted`]），
+    /// 因为那时我们不知道驱动做了什么、也不知道它会不会返回。
     #[error("设备操作超时（{0} 秒）")]
     Timeout(u64),
 
@@ -245,7 +261,11 @@ impl DeviceError {
             Self::InvalidCardNo(_) => 9,
             Self::Unsupported(_) => 10,
             Self::StateFile(_) => 11,
-            Self::Timeout(_) | Self::Protocol(_) | Self::Io(_) | Self::IdCardService(_) => -1,
+            Self::Timeout(_)
+            | Self::SessionUntrusted(_)
+            | Self::Protocol(_)
+            | Self::Io(_)
+            | Self::IdCardService(_) => -1,
         }
     }
 
@@ -274,6 +294,7 @@ impl DeviceError {
             Self::DriverExportMissing(_) => "driver_export_missing",
             Self::NotOpen => "not_open",
             Self::Timeout(_) => "timeout",
+            Self::SessionUntrusted(_) => "session_untrusted",
             Self::Protocol(_) => "protocol",
             Self::Io(_) => "io",
             Self::IdCardService(_) => "id_card_service",
@@ -309,6 +330,9 @@ impl DeviceError {
             Self::StateFile(_) => "卡号状态文件读写失败（新版直接加载驱动，不应出现此错误）。",
             Self::NotOpen => "设备尚未就绪，请先打开读卡器再重试。",
             Self::Timeout(_) => "设备无响应。检查读卡器连接后重试；反复出现请重启程序。",
+            Self::SessionUntrusted(_) => {
+                "设备会话已失效，必须关闭程序后重新启动。继续操作可能把卡写坏。"
+            }
             Self::Protocol(_) => "读卡器返回了无法识别的内容。请导出诊断包反馈。",
             Self::Io(_) => "与设备通信失败，请重试或重启程序。",
             Self::IdCardService(_) => {
@@ -331,6 +355,7 @@ impl DeviceError {
                 | Self::HandshakeFailed
                 | Self::NotOpen
                 | Self::Timeout(_)
+                | Self::SessionUntrusted(_)
                 | Self::Io(_)
         )
     }
