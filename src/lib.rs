@@ -39,10 +39,20 @@
 //! 现在改为 Rust 直接 `LoadLibrary("LC32RFRW.dll")` 并复刻原 C# 上层的全部协议逻辑，
 //! 房号文本只存在于业务层数据库，硬件层只认序号。
 
+pub mod builder;
 pub mod card;
 pub mod card_device;
 pub mod error;
 pub mod idcard;
+pub mod parser;
+pub mod selftest;
+
+pub use builder::{
+    build_checkout_hour, build_clear, build_guest_day, build_guest_hour, build_install,
+    build_master, build_reset, build_timesync, decode_timestamp_card_no, duration_days_code,
+    duration_hours_code, next_stamp, restore_year, timestamp_card_no, to_raw28, year_month_byte,
+    Pages, ERASE_PAGES, WRITE_PASSWORD,
+};
 
 pub use card::{
     decode_room_index, encode_room_index, CardDuration, CardIssuedAt, CardKind, CardSnapshot,
