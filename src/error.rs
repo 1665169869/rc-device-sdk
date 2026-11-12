@@ -105,10 +105,28 @@ pub enum DeviceError {
     #[error("该卡型当前不支持：{0}")]
     Unsupported(String),
 
-    /// SDK 码 11：卡号状态文件读写失败。
+    /// SDK 码 11：卡号状态文件读写失败。**已废弃，当前实现绝不会产生它。**
     ///
-    /// 直接加载 DLL 的方案**不再使用任何状态文件**（卡号水位由业务层数据库维护），
-    /// 这个变体只为与原 SDK 错误码表保持一一对应而保留，当前实现不会产生它。
+    /// # 为什么废弃
+    ///
+    /// 直接加载 DLL 的方案**不使用任何状态文件**。卡号水位由业务层数据库维护：
+    /// 硬件层只接收业务层算好的 `card_no: u16` 并校验范围，既不读也不写任何
+    /// 水位文件。旧版 `PMSLockCard.exe` 用 `RoomIndex.ini` 一类文件记卡号，
+    /// 那套做法在本项目里已被彻底移除。
+    ///
+    /// # 为什么还留着这个变体
+    ///
+    /// 只为**与原 SDK 的 `LockResult` 错误码表保持一一对应**。分析旧系统日志或
+    /// 诊断包时，码 11 需要能翻译回「卡号状态文件错误」。删掉变体会让码表出现
+    /// 空洞，对照关系就此失传。
+    ///
+    /// # 给后续维护者
+    ///
+    /// 不要构造这个变体。若将来真的需要文件状态，应当新开一个语义明确的变体
+    /// （状态文件具体存什么？为何不能进数据库？），而不是复用这个。
+    #[deprecated(
+        note = "新版直接加载驱动，不使用任何状态文件；此变体仅为兼容旧 SDK 错误码 11 而保留，不要构造"
+    )]
     #[error("卡号状态文件读写失败：{0}")]
     StateFile(String),
 
@@ -203,6 +221,13 @@ impl DeviceError {
     ///
     /// 多个硬件层自有变体映射到同一个 SDK 码是**有意为之**：前端对
     /// 「驱动加载失败」只需一种表现，细分信息保留在本层供诊断包使用。
+    ///
+    /// # 关于 `StateFile` 的 `allow(deprecated)`
+    ///
+    /// [`DeviceError::StateFile`] 已废弃（新版不碰任何状态文件），但它仍要在这张
+    /// 码表里占住 11——否则旧系统日志里的码 11 就翻译不回来了。这里是**唯一**
+    /// 允许引用该变体的地方，`allow` 是有意为之，不是遗漏。
+    #[allow(deprecated)]
     pub fn sdk_code(&self) -> i32 {
         match self {
             Self::Param(_) => 1,
@@ -227,6 +252,10 @@ impl DeviceError {
     /// 稳定的故障分类标识（`snake_case`），供业务层做埋点与诊断包分组。
     ///
     /// 与 Rust 变体名解耦：变体名可以随重构变化，这个字符串不能变。
+    ///
+    /// `allow(deprecated)` 的理由同 [`Self::sdk_code`]：`"state_file"` 这个字符串
+    /// 已经是对外契约的一部分，即使变体废弃也不能把字符串从 match 里删掉。
+    #[allow(deprecated)]
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Param(_) => "param",
@@ -252,6 +281,10 @@ impl DeviceError {
     }
 
     /// 给现场人员看的处理建议。业务层直接展示这段文本，不再自行拼文案。
+    ///
+    /// `allow(deprecated)`：`StateFile` 虽然不会产生，但 `payload()` 对它仍要
+    /// 给出可读文案——万一将来有人从旧数据里还原出这个错误，界面不该显示空白。
+    #[allow(deprecated)]
     pub fn hint(&self) -> &'static str {
         match self {
             Self::Param(_) => "检查传入的房间序号、时长、卡号是否在允许范围内。",
@@ -339,6 +372,9 @@ mod tests {
     use super::*;
 
     /// SDK 码必须与原 C# `LockResult` 完全对齐，否则前端的错误表现会漂移。
+    ///
+    /// 含已废弃的 `StateFile`（码 11）：码表对齐关系本身不能因为变体废弃而失效。
+    #[allow(deprecated)]
     #[test]
     fn sdk_codes_match_original_lock_result() {
         assert_eq!(DeviceError::Param("x".into()).sdk_code(), 1);
@@ -407,6 +443,10 @@ mod tests {
     ///
     /// 硬件层不认识房号、房态、入住。一旦这些词出现在错误消息或处理建议里，
     /// 说明有人把业务判断塞进了 Rust 侧。
+    ///
+    /// `allow(deprecated)`：已废弃的 `StateFile` 也在检查范围内，
+    /// 免得它暗中带进业务词而没人发现。
+    #[allow(deprecated)]
     #[test]
     fn error_text_never_mentions_business_concepts() {
         let all = [
@@ -467,7 +507,27 @@ mod tests {
         assert_eq!(DeviceError::VerifyFailed.kind(), "verify_failed");
     }
 
+    /// 已废弃的 `StateFile` 仍占住 SDK 码 11，且 `kind` 字符串不变。
+    ///
+    /// 码表是**对外契约**：旧系统的日志与诊断包里可能出现码 11，
+    /// 它必须能被翻译回 `"state_file"`。变体废弃不等于契约作废。
+    #[allow(deprecated)]
+    #[test]
+    fn deprecated_state_file_keeps_its_sdk_code() {
+        let e = DeviceError::StateFile("x".into());
+        assert_eq!(e.sdk_code(), 11, "码 11 不能因废弃而失效");
+        assert_eq!(e.kind(), "state_file", "kind 字符串不能因废弃而改");
+        assert!(!e.is_device_fault(), "状态文件问题不是设备故障");
+        // payload 仍要能构造，且文案不为空（界面不该显示空白）
+        let p = e.payload();
+        assert_ne!(p.message.trim(), "", "消息不能为空");
+        assert_ne!(p.hint.trim(), "", "处理建议不能为空");
+    }
+
     /// 每个变体都必须有非空的处理建议。
+    ///
+    /// `allow(deprecated)`：已废弃的 `StateFile` 也要有文案，理由见 [`DeviceError::hint`]。
+    #[allow(deprecated)]
     #[test]
     fn every_variant_has_a_hint() {
         let samples = [
