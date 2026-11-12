@@ -257,22 +257,72 @@ impl DirectDllDevice {
         }
         sleep_ms(WRITE_PAGE2_DELAY_MS);
 
-        // 回读校验：最多 3 次。写完立刻读可能拿到旧值，这是协议要求不是容错。
-        for _ in 0..VERIFY_ATTEMPTS {
-            if let Ok(raw) = Self::read_raw(&st) {
-                if raw[0..4] == p1 && raw[4..8] == p2 {
-                    dll.beep_times(2);
-                    let mut snap = parser::parse(&raw)?;
-                    if let Some(idx) = room_index {
-                        snap.room_index = Some(idx);
-                    }
-                    return Ok(snap);
-                }
-            }
-            sleep_ms(VERIFY_RETRY_DELAY_MS);
+        // 回读校验：写完立刻读可能拿到旧值（实测结论），所以最多试 3 次。
+        // 重试是**协议的一部分**，不是容错；整次写卡绝不因此重来。
+        let raw = verify_written(
+            || Self::read_raw(&st),
+            p1,
+            p2,
+            VERIFY_ATTEMPTS,
+            VERIFY_RETRY_DELAY_MS,
+        )?;
+
+        dll.beep_times(2);
+        let mut snap = parser::parse(&raw)?;
+        if let Some(idx) = room_index {
+            snap.room_index = Some(idx);
         }
-        Err(DeviceError::VerifyFailed)
+        Ok(snap)
     }
+}
+
+/// 回读校验：反复读卡，直到页1/页2 与刚写入的一致，或次数用尽。
+///
+/// # 为什么抽成独立函数
+///
+/// 这段逻辑是整条写卡流程里**唯一有分支**的地方，而它偏偏依赖真实驱动
+/// （`read_raw` 从会话句柄取数据）。抽出来以后，测试只需传一个闭包就能构造
+/// 「前两次拿到旧值、第三次才刷新」这种场景——那正是真机上最常遇到的。
+///
+/// # 参数
+///
+/// - `read`：读一次卡的闭包。生产代码传真实驱动，测试传脚本化的假实现。
+/// - `p1` / `p2`：刚写进去的页1、页2，用来和读回的结果逐字节比对。
+/// - `attempts`：最多读几次（协议值 [`VERIFY_ATTEMPTS`]，此处可注入便于测试）。
+/// - `retry_delay_ms`：两次读之间的间隔；测试传 0，不白等。
+///
+/// # 返回
+///
+/// 成功时给出**读回的那 28 字节**（不是刚写入的 p1/p2）——后续解析要用它，
+/// 这样「写入的」和「读回的」若有差异会立刻暴露在解析结果里。
+///
+/// # 读卡报错的处理
+///
+/// 读卡失败（驱动返回非零）与「读到了但内容还是旧值」都只是继续重试：
+/// 卡刚写完时驱动可能短暂报错。次数用尽后统一报 [`DeviceError::VerifyFailed`]，
+/// 因为此时**已经不知道卡里是什么**了，这比报 `ReadFailed` 更贴近事实。
+fn verify_written<F>(
+    mut read: F,
+    p1: [u8; 4],
+    p2: [u8; 4],
+    attempts: u32,
+    retry_delay_ms: u64,
+) -> DeviceResult<[u8; CARD_BYTES]>
+where
+    F: FnMut() -> DeviceResult<[u8; CARD_BYTES]>,
+{
+    for attempt in 0..attempts {
+        if let Ok(raw) = read() {
+            if raw[0..4] == p1 && raw[4..8] == p2 {
+                return Ok(raw);
+            }
+        }
+        // 最后一次失败后不再等待，直接返回，别让前台多等一个 retry_delay
+        if attempt + 1 < attempts {
+            sleep_ms(retry_delay_ms);
+        }
+    }
+    Err(DeviceError::VerifyFailed)
 }
 
 impl CardDevice for DirectDllDevice {
@@ -716,6 +766,176 @@ mod tests {
         assert_eq!(info.backend, DeviceBackend::DirectDll);
         assert!(!info.opened);
         assert_eq!(info.baud, SERIAL_BAUD);
+    }
+
+    // ---------------------------------------------------------- 回读校验（TD-005）
+
+    /// 回读校验用的 28 字节：页1/页2 为指定值，其余补零。
+    fn raw_of(p1: [u8; 4], p2: [u8; 4]) -> [u8; CARD_BYTES] {
+        let mut raw = [0u8; CARD_BYTES];
+        raw[0..4].copy_from_slice(&p1);
+        raw[4..8].copy_from_slice(&p2);
+        raw
+    }
+
+    /// 新写入的页（期望值）。
+    fn fresh() -> ([u8; 4], [u8; 4]) {
+        ([0x5B, 0xEC, 0x18, 0x01], [0x46, 0xF2, 0x00, 0x01])
+    }
+
+    /// 卡里原有内容的旧值（与期望不同）。
+    fn stale() -> ([u8; 4], [u8; 4]) {
+        ([0x5B, 0xEC, 0x00, 0x00], [0x80, 0x01, 0x00, 0xAB])
+    }
+
+    /// 第一次就读对了 → 立即返回，不该有多余读取。
+    ///
+    /// 发卡台是高频操作，每次写卡都白等是不必要的。
+    #[test]
+    fn verify_returns_immediately_when_first_read_matches() {
+        let (p1, p2) = fresh();
+        let mut calls = 0;
+        let got = verify_written(
+            || {
+                calls += 1;
+                Ok(raw_of(p1, p2))
+            },
+            p1,
+            p2,
+            3,
+            0,
+        )
+        .expect("第一次就对上，应当成功");
+
+        assert_eq!(calls, 1, "对上之后不该再读");
+        assert_eq!(&got[0..8], &raw_of(p1, p2)[0..8]);
+    }
+
+    /// **核心场景**：前两次读到旧值，第三次才刷新 → 成功。
+    ///
+    /// 这是真机上最常遇到的情况：写完立刻读会拿到卡里原来的内容。
+    /// 这条测试此前写不出来，因为回读循环直接取驱动句柄。
+    #[test]
+    fn verify_succeeds_after_two_stale_reads() {
+        let (p1, p2) = fresh();
+        let (s1, s2) = stale();
+        let mut calls = 0;
+
+        let got = verify_written(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Ok(raw_of(s1, s2))
+                } else {
+                    Ok(raw_of(p1, p2))
+                }
+            },
+            p1,
+            p2,
+            3,
+            0,
+        )
+        .expect("第三次应读到新值并成功");
+
+        assert_eq!(calls, 3, "应当恰好读 3 次");
+        assert_eq!(&got[0..8], &raw_of(p1, p2)[0..8]);
+    }
+
+    /// 三次都读到旧值 → `VerifyFailed`。
+    ///
+    /// 这条错误分支此前从未被执行过。它是「卡可能写了一半」的信号，
+    /// 前台必须人工介入，所以行为必须确定。
+    #[test]
+    fn verify_fails_after_all_attempts_are_stale() {
+        let (p1, p2) = fresh();
+        let (s1, s2) = stale();
+        let mut calls = 0;
+
+        let err = verify_written(
+            || {
+                calls += 1;
+                Ok(raw_of(s1, s2))
+            },
+            p1,
+            p2,
+            VERIFY_ATTEMPTS,
+            0,
+        )
+        .expect_err("一直读到旧值应当失败");
+
+        assert_eq!(calls, VERIFY_ATTEMPTS, "读满次数后必须停手，绝不自动重试写卡");
+        assert_eq!(err, DeviceError::VerifyFailed);
+        assert_eq!(err.sdk_code(), 8);
+    }
+
+    /// 读卡一直报错 → 同样报 `VerifyFailed`。
+    ///
+    /// 此时已经不知道卡里是什么，报 `VerifyFailed` 比报 `ReadFailed` 更贴近事实，
+    /// 处理建议也是「把卡放稳重试；多次失败换一张卡」。
+    #[test]
+    fn verify_treats_read_errors_like_stale_reads() {
+        let (p1, p2) = fresh();
+        let mut calls = 0;
+
+        let err = verify_written(
+            || {
+                calls += 1;
+                Err(DeviceError::ReadFailed("驱动返回 6".to_string()))
+            },
+            p1,
+            p2,
+            VERIFY_ATTEMPTS,
+            0,
+        )
+        .expect_err("读卡全失败应当报校验失败");
+
+        assert_eq!(calls, VERIFY_ATTEMPTS);
+        assert_eq!(err, DeviceError::VerifyFailed);
+    }
+
+    /// 只有页1 对上、页2 还是旧值 → 不算成功。
+    ///
+    /// 协议要求两页都写进去。只写了一半的卡必须报失败，
+    /// 否则会产出一张「读得出但打不开门」的卡。
+    #[test]
+    fn verify_requires_both_pages_to_match() {
+        let (p1, p2) = fresh();
+        let (_, s2) = stale();
+
+        let err = verify_written(
+            || Ok(raw_of(p1, s2)),
+            p1,
+            p2,
+            VERIFY_ATTEMPTS,
+            0,
+        )
+        .expect_err("页2 不符不能算成功");
+
+        assert_eq!(err, DeviceError::VerifyFailed);
+    }
+
+    /// 一次也不读时（attempts = 0）直接失败，不进入任何读卡动作。
+    ///
+    /// 防的是调用方把 `VERIFY_ATTEMPTS` 误配成 0 却静默返回成功。
+    #[test]
+    fn verify_with_zero_attempts_fails_without_reading() {
+        let (p1, p2) = fresh();
+        let mut calls = 0;
+
+        let err = verify_written(
+            || {
+                calls += 1;
+                Ok(raw_of(p1, p2))
+            },
+            p1,
+            p2,
+            0,
+            0,
+        )
+        .expect_err("0 次尝试必然是失败");
+
+        assert_eq!(calls, 0);
+        assert_eq!(err, DeviceError::VerifyFailed);
     }
 
     /// 仓库里这份驱动必须被判为「已验证」——这是哈希告警机制的正向基线。

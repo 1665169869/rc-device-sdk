@@ -31,6 +31,7 @@ use std::path::PathBuf;
 use rc_device::card::CardKind;
 use rc_device::card_device::CardDevice;
 use rc_device::dll::DirectDllDevice;
+use rc_device::InstallSpec;
 
 /// 真机测试开关。
 fn hw_enabled() -> bool {
@@ -185,4 +186,79 @@ fn selftest_green_on_hardware_machine() {
     println!("自检: {} 通过 / {} 失败", report.passed, report.failed);
     assert_eq!(report.total(), 46);
     assert!(report.is_all_green(), "46 项自检必须全绿");
+}
+
+/// 真机写卡：写入安装卡并回读校验。
+///
+/// # 为什么写安装卡
+///
+/// 安装卡**不占作业流水号**（页2 固定 `46 F2 00 01`），是唯一一种
+/// 「写坏了也不会污染卡号序列」的卡。客卡写坏会让流水号凭空推进一张，
+/// 那是比写失败更难收拾的事故。
+///
+/// # 为什么要"按原内容重写"
+///
+/// 本测试会**真的改动卡片内容**。为了做到可反复运行、且不把现场有用的卡
+/// 变成别的东西，这里只做幂等写入：
+///
+/// 1. 先读卡，确认它当前就是安装卡；
+/// 2. 用**读到的同一个 `room_index`** 重写一遍。
+///
+/// 这样写进去的字节与原来完全相同，验证了整条写卡链路却不让卡变成另一种卡。
+/// 若卡不是安装卡，直接跳过——绝不在陌生卡上试写。
+#[test]
+fn write_install_card_to_real_hardware() {
+    let Some(dev) = device_or_skip("write_install") else {
+        return;
+    };
+    dev.open().expect("打开应当成功");
+
+    // 1) 先看看卡里现在是什么
+    let before = dev.read_card().expect("写卡前应先能读卡");
+    println!("[写卡前] 卡型: {}", before.kind.label());
+    println!("[写卡前] 序号: {:?}", before.room_index);
+    println!("[写卡前] 原始: {}", before.raw_hex());
+
+    if before.kind != CardKind::Install {
+        println!(
+            "[write_install] 跳过：当前卡是 {}，不是安装卡。\
+             本测试只在安装卡上做幂等重写，不在陌生卡上试写。",
+            before.kind.label()
+        );
+        dev.close().ok();
+        return;
+    }
+
+    let room_index = before
+        .room_index
+        .expect("安装卡必须带房间序号，否则解析已出问题");
+
+    // 2) 用同一个序号重写，字节应当与原来完全一致
+    let spec = InstallSpec { room_index };
+    let written = dev.write_install(&spec).expect("写安装卡应当成功");
+
+    println!("[写卡后] 卡型: {}", written.kind.label());
+    println!("[写卡后] 序号: {:?}", written.room_index);
+    println!("[写卡后] 原始: {}", written.raw_hex());
+
+    // 3) 回读校验的结论必须是"写的就是读到的"
+    assert_eq!(written.kind, CardKind::Install, "写回后应仍是安装卡");
+    assert_eq!(
+        written.room_index,
+        Some(room_index),
+        "写回后序号应保持不变"
+    );
+    assert_eq!(
+        written.raw_hex(),
+        before.raw_hex(),
+        "按原序号重写，28 字节应与写前完全一致"
+    );
+    assert_eq!(written.card_no, None, "安装卡不占作业流水号");
+
+    // 4) 再独立读一次，确认不是只信写卡返回的快照
+    let after = dev.read_card().expect("写卡后应能再次读到");
+    assert_eq!(after.raw_hex(), before.raw_hex(), "独立重读应与写前一致");
+    assert_eq!(after.kind, CardKind::Install);
+
+    dev.close().expect("关闭应当成功");
 }
