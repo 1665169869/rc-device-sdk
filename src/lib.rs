@@ -86,6 +86,8 @@ pub mod card_device;
 pub mod dll;
 pub mod error;
 pub mod idcard;
+pub mod idcard_proto;
+pub mod idcard_ws;
 pub mod parser;
 pub mod protocol;
 pub mod selftest;
