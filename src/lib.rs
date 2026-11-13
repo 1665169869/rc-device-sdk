@@ -91,21 +91,24 @@ pub mod idcard_ws;
 pub mod parser;
 pub mod protocol;
 pub mod selftest;
+pub mod sidecar;
+pub mod sim;
 
 pub use builder::{
     build_checkout_hour, build_clear, build_guest_day, build_guest_hour, build_install,
-    build_master, build_reset, build_timesync, decode_timestamp_card_no, duration_days_code,
-    duration_hours_code, next_stamp, restore_year, timestamp_card_no, to_raw28, year_month_byte,
-    Pages, ERASE_PAGES, WRITE_PASSWORD,
+    build_master, build_raw, build_reset, build_timesync, decode_timestamp_card_no,
+    duration_days_code, duration_hours_code, next_stamp, restore_year, timestamp_card_no,
+    to_raw28, year_month_byte, Pages, ERASE_PAGES, WRITE_PASSWORD,
 };
 
 pub use card::{
     decode_room_index, encode_room_index, CardDuration, CardIssuedAt, CardKind, CardSnapshot,
     CardStamp, CheckoutHourSpec, DeviceBackend, DeviceInfo, DriverHashStatus, GuestDaySpec,
-    GuestHourSpec, InstallSpec, MasterSpec, PlainCardSpec, PortProbe, SelfTestCase,
+    GuestHourSpec, InstallSpec, MasterSpec, PlainCardSpec, PortProbe, RawSpec, SelfTestCase,
     SelfTestReport, TimeSyncSpec, CARD_BYTES, CARD_PREFIX, MASTER_ROOM_INDEX, PAGE_BYTES,
     ROOM_INDEX_MAX,
 };
 pub use card_device::CardDevice;
 pub use error::{DeviceError, DeviceErrorPayload, DeviceResult, DriverArch};
 pub use idcard::{IdCardData, IdCardProbeSpec, IdCardReadSpec, IdCardReader, IdCardServiceInfo};
+pub use sidecar::{Operation, Request, RequestId, Response};

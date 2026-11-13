@@ -319,6 +319,75 @@ pub struct PlainCardSpec {
     pub issued_at: CardIssuedAt,
 }
 
+/// 原始直写入参：把 8 字节原样写进卡。
+///
+/// # 这是唯一一个「没有协议语义」的入参
+///
+/// 其余 `*Spec` 都描述一种确定的卡型，构造出的字节可被黄金向量校验；
+/// 本类型不做任何位域检查、不计算时长码与卡号——调用方给什么就写什么。
+/// 因此它可能把卡写成**任意卡型或废卡**，只用于逆向验证与现场排障：
+///
+/// - 正常发卡一律用 [`GuestDaySpec`]、[`MasterSpec`] 这类定型入参；
+/// - 擦卡用 [`crate::CardDevice::erase_card`]，不要用 `p1`/`p2` 全零绕过它
+///   （擦卡有独立的错误语义，且不消耗作业流水号）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawSpec {
+    /// 页1 的 4 字节，按原样写入。
+    pub p1: [u8; 4],
+    /// 页2 的 4 字节，按原样写入。
+    pub p2: [u8; 4],
+}
+
+impl RawSpec {
+    /// 用两段十六进制文本构造（`"5BECF000"` / `"810424AB"`）。
+    ///
+    /// 只做长度与字符检查，**不校验含义**。
+    ///
+    /// # 错误
+    ///
+    /// 任一段不是恰好 8 个十六进制字符时返回 [`DeviceError::Param`]。
+    pub fn from_hex(p1: &str, p2: &str) -> crate::error::DeviceResult<Self> {
+        Ok(Self {
+            p1: parse_hex4(p1)?,
+            p2: parse_hex4(p2)?,
+        })
+    }
+
+    /// 页1/页2 的大写十六进制文本，便于日志与界面回显。
+    pub fn hex(&self) -> (String, String) {
+        (hex4(&self.p1), hex4(&self.p2))
+    }
+}
+
+/// `"5BECF000"` → `[0x5B, 0xEC, 0xF0, 0x00]`。
+fn parse_hex4(text: &str) -> crate::error::DeviceResult<[u8; 4]> {
+    let t = text.trim();
+    if t.len() != 8 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(crate::error::DeviceError::Param(format!(
+            "页数据必须是 8 个十六进制字符，实际 {t:?}"
+        )));
+    }
+    let mut out = [0u8; 4];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let pair = &t[i * 2..i * 2 + 2];
+        *slot = u8::from_str_radix(pair, 16).map_err(|e| {
+            crate::error::DeviceError::Param(format!("十六进制解析失败 {pair:?}: {e}"))
+        })?;
+    }
+    Ok(out)
+}
+
+/// 4 字节 → 大写十六进制（8 个字符）。
+fn hex4(bytes: &[u8; 4]) -> String {
+    let mut s = String::with_capacity(8);
+    for b in bytes {
+        s.push(HEX_UPPER[(b >> 4) as usize] as char);
+        s.push(HEX_UPPER[(b & 0x0F) as usize] as char);
+    }
+    s
+}
+
 /// 退房钟点设置卡入参。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

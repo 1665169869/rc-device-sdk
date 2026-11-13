@@ -18,7 +18,7 @@
 
 use crate::card::{
     encode_room_index, CardDuration, CardIssuedAt, CheckoutHourSpec, GuestDaySpec, GuestHourSpec,
-    InstallSpec, MasterSpec, PlainCardSpec, TimeSyncSpec, CARD_PREFIX, ROOM_INDEX_MAX,
+    InstallSpec, MasterSpec, PlainCardSpec, RawSpec, TimeSyncSpec, CARD_PREFIX, ROOM_INDEX_MAX,
 };
 use crate::error::{DeviceError, DeviceResult};
 
@@ -504,6 +504,24 @@ pub fn build_timesync(spec: &TimeSyncSpec) -> DeviceResult<Pages> {
 /// **注意**：这不会让门锁里已有的授权消失。
 pub const ERASE_PAGES: Pages = (ERASE_PAGE, ERASE_PAGE);
 
+/// 原始直写：把给定页原样返回。
+///
+/// # 为什么不做校验
+///
+/// 本函数**不是**某一种卡型的编码规则，而是「调用方给了什么就写什么」的逃生门
+/// （逆向验证、现场排障）。入了参就是四字节页，位域含义由调用方自己负责——
+/// 一旦在这里加检查，就等于替调用方猜他想写哪种卡，反而更容易写出半对半错的卡。
+///
+/// # 为什么不进 46 项黄金向量
+///
+/// 黄金向量的价值是「编码结果必须等于原厂字节」。原始直写没有编码，
+/// 期望值恒等于入参，放进去只会凑数。它的正确性由 `to_raw28` 的往返测试保证。
+///
+/// 擦卡请用 [`ERASE_PAGES`] + [`crate::CardDevice::erase_card`]，不要用它绕过。
+pub fn build_raw(spec: &RawSpec) -> Pages {
+    (spec.p1, spec.p2)
+}
+
 /// 把页1/页2 拼成 28 字节卡数据（页3–7 恒为 0）。
 pub fn to_raw28(p1: &[u8; 4], p2: &[u8; 4]) -> [u8; crate::card::CARD_BYTES] {
     let mut raw = [0u8; crate::card::CARD_BYTES];
@@ -985,6 +1003,31 @@ mod tests {
         assert_eq!(ERASE_PAGES.1, [0u8; 4]);
         let raw = to_raw28(&ERASE_PAGES.0, &ERASE_PAGES.1);
         assert!(raw.iter().all(|b| *b == 0), "擦卡必须写出全零 28 字节");
+    }
+
+    /// 原始直写不解释入参：给什么写什么，一个 bit 都不改。
+    #[test]
+    fn build_raw_passes_bytes_through_unchanged() {
+        let spec =
+            RawSpec::from_hex("5BECF000", "810424AB").expect("合法十六进制必须能构造 RawSpec");
+        let (p1, p2) = build_raw(&spec);
+        assert_eq!(p1, [0x5B, 0xEC, 0xF0, 0x00]);
+        assert_eq!(p2, [0x81, 0x04, 0x24, 0xAB]);
+        let raw = to_raw28(&p1, &p2);
+        assert_eq!(&raw[0..4], &p1, "页1 必须原样落在前 4 字节");
+        assert_eq!(&raw[4..8], &p2, "页2 必须原样落在 5–8 字节");
+        assert!(raw[8..].iter().all(|b| *b == 0), "页3–7 恒为零");
+    }
+
+    /// 原始直写与擦卡是两条路径：`build_raw` 全零入参的结果必须与 `ERASE_PAGES` 一致，
+    /// 但擦卡仍应走 `erase_card`（有独立错误语义、不耗卡号）。
+    #[test]
+    fn build_raw_with_zero_pages_matches_erase() {
+        let spec = RawSpec {
+            p1: [0u8; 4],
+            p2: [0u8; 4],
+        };
+        assert_eq!(build_raw(&spec), ERASE_PAGES);
     }
 
     /// 拼装 28 字节时页3–7 必须全零。

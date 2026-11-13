@@ -68,7 +68,7 @@
 
 use crate::card::{
     CheckoutHourSpec, DeviceInfo, GuestDaySpec, GuestHourSpec, InstallSpec, MasterSpec,
-    PlainCardSpec, PortProbe, SelfTestReport, TimeSyncSpec,
+    PlainCardSpec, PortProbe, RawSpec, SelfTestReport, TimeSyncSpec,
 };
 use crate::error::DeviceResult;
 use crate::CardSnapshot;
@@ -156,6 +156,22 @@ pub trait CardDevice: Send + Sync {
     ///
     /// 注意：这只是把卡擦白，不会让门锁里已有的授权消失。
     fn erase_card(&self) -> DeviceResult<CardSnapshot>;
+
+    /// 原始直写：把 8 字节原样写进卡，**不做任何校验**。
+    ///
+    /// # 破坏性
+    ///
+    /// 这是唯一一个「没有卡型语义」的写卡入口：入参是什么字节，卡就变成什么字节，
+    /// 因此它可以把卡写成任意卡型，也可以写成一张谁也读不懂的废卡。
+    /// 只用于逆向验证与现场排障；**正常发卡与擦卡都不要用它**
+    /// （擦卡请用 [`CardDevice::erase_card`]，它有独立的错误语义且不消耗作业流水号）。
+    ///
+    /// # 错误
+    ///
+    /// 与其它写卡方法相同：设备未打开、无卡、写失败、写后回读不一致，
+    /// 以及写入后**解析不出卡型**（[`DeviceError::ReadFailed`]）——
+    /// 后者正是"写进去了一坨废卡"的正常表现，调用方必须把它当成失败处理。
+    fn write_raw(&self, spec: &RawSpec) -> DeviceResult<CardSnapshot>;
 
     // ------------------------------------------------------------ 环境
 

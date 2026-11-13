@@ -1,28 +1,40 @@
 //! 真机联调入口：探测端口、读卡、跑自检。
 //!
-//! 用法（必须先按 32 位目标编译，因为驱动只有 x86 版本）：
+//! 用法（真机必须先按 32 位目标编译，因为驱动只有 x86 版本）：
 //!
 //! ```text
 //! cargo run -p rc-device --bin probe --target i686-pc-windows-msvc
+//! cargo run -p rc-device --bin probe -- --sim     # 内存模拟，不碰硬件
 //! ```
 
 use std::path::PathBuf;
 
 use rc_device::card_device::CardDevice;
 use rc_device::dll::DirectDllDevice;
+use rc_device::sim::SimCardDevice;
 
 fn main() {
+    let sim = std::env::args()
+        .skip(1)
+        .any(|a| a == "--sim" || a == "--mock");
+
     let driver_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
         .join("drivers")
         .join("LC2000");
 
-    println!("=== 硬件层真机联调 ===");
+    println!("=== 硬件层联调 ===");
     println!("宿主架构: {}", std::env::consts::ARCH);
-    println!("驱动目录: {}", driver_dir.display());
+    if sim {
+        println!("后端    : 内存模拟（--sim，不碰硬件）");
+    } else {
+        println!("驱动目录: {}", driver_dir.display());
+    }
 
-    let dev = DirectDllDevice::with_auto_port(&driver_dir);
+    let dev: Box<dyn CardDevice> = if sim {
+        Box::new(SimCardDevice::new())
+    } else {
+        Box::new(DirectDllDevice::with_auto_port(&driver_dir))
+    };
 
     // 1) 设备信息
     match dev.device_info() {

@@ -1,21 +1,22 @@
 [package]
 name = "rc-device"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-description = "客房微管理发卡台 · 硬件层接口契约（125 kHz 门锁卡读写器 + 身份证读卡器）"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "MIT"
+description = "125 kHz TEMIC 门锁卡读写器 + 身份证读卡器的 Rust SDK（Windows）"
+readme = "README.md"
 
-# 本 crate 放接口契约（trait / 类型 / 错误）与硬件实现。
+# 硬件层 SDK：只做设备 I/O，不含任何业务规则、不访问数据库。
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
-# 动态加载 LC32RFRW.dll（TD-002）。该驱动只有 x86 版本，宿主必须按 i686 构建。
+# 动态加载 LC32RFRW.dll。该驱动只有 x86 版本，宿主必须按 i686 构建。
 libloading = "0.8"
-# 身份证读卡服务的 WebSocket 客户端（TD-007）。
+# 身份证读卡服务的 WebSocket 客户端。
 # 只连本机 `ws://127.0.0.1:9001`，因此关掉默认 TLS，不引入 rustls/native-tls；
 # 同步阻塞实现，与设备层现有的「Mutex 串行 + 同步调用」风格一致，不拉 tokio 运行时。
-# 钉在 0.29：0.30 要求 rustc 1.85，而 workspace 声明 rust-version 1.77。
+# 钉在 0.29：0.30 要求 rustc 1.85，而本 crate 声明 rust-version 1.77。
 tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 serde_json = "1"
 

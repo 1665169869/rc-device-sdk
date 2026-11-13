@@ -10,7 +10,7 @@ use rc_device::{
     CardDevice, CardDuration, CardIssuedAt, CardKind, CardSnapshot, CheckoutHourSpec, DeviceBackend,
     DeviceError, DeviceInfo, DeviceResult, DriverArch, DriverHashStatus, GuestDaySpec, GuestHourSpec,
     IdCardData, IdCardProbeSpec, IdCardReadSpec, IdCardReader, IdCardServiceInfo, InstallSpec,
-    MasterSpec, PlainCardSpec, PortProbe, SelfTestReport, TimeSyncSpec, CARD_BYTES,
+    MasterSpec, PlainCardSpec, PortProbe, RawSpec, SelfTestReport, TimeSyncSpec, CARD_BYTES,
 };
 
 /// 发卡时刻固定值，让测试不随真实时间漂移。
@@ -132,6 +132,10 @@ impl CardDevice for MockCardDevice {
     }
 
     fn erase_card(&self) -> DeviceResult<CardSnapshot> {
+        self.next_write()
+    }
+
+    fn write_raw(&self, _spec: &RawSpec) -> DeviceResult<CardSnapshot> {
         self.next_write()
     }
 
@@ -318,6 +322,36 @@ fn selftest_report_survives_trait_boundary() {
     let report = dev.selftest().expect("自检应当成功");
     assert_eq!(report.total(), 46);
     assert!(report.is_all_green());
+}
+
+/// 生产用的模拟后端（`sim::SimCardDevice`）必须同样满足契约。
+///
+/// 与 `MockCardDevice` 的区别：mock 只回放预置结果，模拟后端真的跑
+/// `builder` + `parser`，因此它能抓住「契约被实现歪了」这类问题——
+/// 写进去的字节必须能原样读回来，擦卡必须写出全零，自检必须 46 项全绿。
+#[test]
+fn sim_backend_satisfies_the_contract() {
+    let dev = rc_device::sim::SimCardDevice::new();
+    let spec = GuestDaySpec {
+        room_index: 15,
+        days: 1,
+        card_no: rc_device::timestamp_card_no(&issued_at(), 0).expect("卡号应可编码"),
+        lost: false,
+        issued_at: issued_at(),
+    };
+
+    let written = dev.write_guest_day(&spec).expect("写卡应当成功");
+    assert_eq!(written.kind, CardKind::GuestDay);
+    assert_eq!(written.room_index, Some(15));
+
+    let back = dev.read_card().expect("读卡应当成功");
+    assert_eq!(back.raw, written.raw, "写进去的字节必须能原样读回来");
+
+    let erased = dev.erase_card().expect("擦卡应当成功");
+    assert_eq!(erased.kind, CardKind::Blank);
+    assert!(erased.raw.iter().all(|b| *b == 0));
+
+    assert!(dev.selftest().expect("自检应当成功").is_all_green());
 }
 
 /// 两个 trait 可以同时被同一个业务用例持有，互不干扰。

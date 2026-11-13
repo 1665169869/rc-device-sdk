@@ -1,0 +1,8 @@
+# Rust 构建产物
+/target/
+**/*.rs.bk
+
+# 本地环境
+.env
+.env.local
+*.log

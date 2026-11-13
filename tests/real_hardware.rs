@@ -40,8 +40,6 @@ fn hw_enabled() -> bool {
 
 fn driver_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
         .join("drivers")
         .join("LC2000")
 }

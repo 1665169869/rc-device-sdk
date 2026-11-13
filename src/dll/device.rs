@@ -40,8 +40,8 @@ use std::time::Duration;
 use crate::builder;
 use crate::card::{
     CardSnapshot, CheckoutHourSpec, DeviceBackend, DeviceInfo, DriverHashStatus, GuestDaySpec,
-    GuestHourSpec, InstallSpec, MasterSpec, PlainCardSpec, PortProbe, SelfTestReport, TimeSyncSpec,
-    CARD_BYTES,
+    GuestHourSpec, InstallSpec, MasterSpec, PlainCardSpec, PortProbe, RawSpec, SelfTestReport,
+    TimeSyncSpec, CARD_BYTES,
 };
 use crate::card_device::CardDevice;
 use crate::dll::arch::KNOWN_DRIVER_SHA256;
@@ -576,6 +576,14 @@ impl CardDevice for DirectDllDevice {
         self.write_pages(p1, p2, None)
     }
 
+    fn write_raw(&self, spec: &RawSpec) -> DeviceResult<CardSnapshot> {
+        // 不经过任何 `build_*`：入参就是最终字节。
+        // `room_index` 传 None —— 原始直写不做位打包，读回来的序号只由 `parser` 决定；
+        // 若在这里按入参覆盖，等于替调用方宣称"这张卡属于某房间"，那是错的。
+        let (p1, p2) = builder::build_raw(spec);
+        self.write_pages(p1, p2, None)
+    }
+
     fn probe_ports(&self) -> DeviceResult<Vec<PortProbe>> {
         let mut out = Vec::with_capacity(usize::from(MAX_PORT_INDEX) + 1);
         for port in 0..=MAX_PORT_INDEX {
@@ -964,8 +972,6 @@ mod tests {
     #[test]
     fn real_driver_hash_matches_known_version() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
             .join("drivers")
             .join("LC2000")
             .join(DRIVER_FILE);
@@ -1282,8 +1288,6 @@ mod tests {
     #[test]
     fn shipped_driver_hash_is_verified() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
             .join("drivers")
             .join("LC2000")
             .join(DRIVER_FILE);

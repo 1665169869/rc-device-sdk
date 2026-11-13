@@ -1,0 +1,27 @@
+# EditorConfig · rc-device SDK
+# 官方说明：https://editorconfig.org
+
+root = true
+
+# Rust 用 4 空格（rustfmt 默认值）；换行统一 LF。
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# Markdown 的硬换行是「行尾两个空格」，裁掉会改变渲染结果。
+[*.md]
+trim_trailing_whitespace = false
+
+# 原厂驱动随仓库原样分发：LC32RFRW.dll 有 SHA-256 / 字节数 / 导出数校验，
+# IODesc.ini 本身就是 CRLF。编辑器不得改写这里的编码与换行。
+[drivers/**]
+charset = unset
+end_of_line = unset
+insert_final_newline = unset
+trim_trailing_whitespace = unset
+indent_style = unset
+indent_size = unset

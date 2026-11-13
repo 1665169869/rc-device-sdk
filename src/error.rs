@@ -376,7 +376,7 @@ impl DeviceError {
 }
 
 /// [`DeviceError`] 的 IPC 传输形态。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceErrorPayload {
     /// 稳定分类标识，见 [`DeviceError::kind`]。
